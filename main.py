@@ -58,6 +58,7 @@ def parse_args():
     parser.add_argument("--list", "-l", action="store_true", help="List available months without processing")
     parser.add_argument("--month", "-m", type=str, help="Specific month to process (format: YYYY-MM, e.g., 2024-11)")
     parser.add_argument("--force", "-f", action="store_true", help="Force re-processing even if already processed")
+    parser.add_argument("--initial-load", action="store_true", help="Use fast INSERT (no conflict handling) - only for empty tables")
     return parser.parse_args()
 
 
@@ -80,8 +81,16 @@ def main():
         sys.exit(1)
 
     db = Database(config.database_url)
+    saved_indexes = {}
 
     try:
+        # Apply PostgreSQL bulk load optimizations
+        db.set_bulk_load_config()
+
+        # DROP all indexes for maximum insert performance
+        print("Dropping indexes for bulk load...")
+        saved_indexes = db.drop_all_indexes_for_bulk_load()
+
         # Select directory
         if args.month:
             available = downloader.get_available_directories()
@@ -118,26 +127,46 @@ def main():
                 try:
                     rows = 0
                     for batch, table_name, columns in process_file(csv_path, config.batch_size):
-                        db.bulk_upsert(batch, table_name, columns)
+                        if args.initial_load:
+                            # Fast path: INSERT direto, sem conflict handling
+                            db.bulk_insert(batch, table_name, columns)
+                        else:
+                            # Safe path: UPSERT com conflict handling
+                            db.bulk_upsert(batch, table_name, columns)
                         rows += len(batch)
                         pbar.set_postfix_str(f"{csv_path.name[:20]} {rows:,} rows")
 
                     db.mark_processed(directory, zip_filename)
 
                 except Exception as e:
-                    logger.error(f"Error: {csv_path.name}: {e}")
+                    logger.error(f"Error processing {csv_path.name}: {e}")
+                    # Parar em vez de continuar - evita dados inconsistentes
+                    raise
 
                 finally:
                     if csv_path.exists() and not config.keep_files:
                         csv_path.unlink()
 
+        # Recreate all indexes after bulk load
+        if saved_indexes:
+            print("Recreating indexes (this may take a while)...")
+            db.create_all_indexes_after_bulk_load(saved_indexes)
+
         print("Done!")
 
     except Exception as e:
         logger.error(f"Failed: {e}")
+        # Still try to recreate indexes on error
+        if saved_indexes:
+            print("Recreating indexes after error...")
+            try:
+                db.create_all_indexes_after_bulk_load(saved_indexes)
+            except Exception as idx_err:
+                logger.error(f"Failed to recreate indexes: {idx_err}")
         sys.exit(1)
 
     finally:
+        db.reset_bulk_load_config()
         db.disconnect()
         downloader.cleanup()
 

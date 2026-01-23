@@ -7,3 +7,7 @@ temp/
 .pytest_cache/
 .coverage
 coverage.xml
+# Logs
+*.log
+ingestao.log
+sync_es.log

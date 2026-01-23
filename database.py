@@ -3,7 +3,7 @@
 import io
 import logging
 import time
-from typing import List, Set
+from typing import List, Set, Optional
 from urllib.parse import urlparse
 
 import polars as pl
@@ -13,11 +13,12 @@ logger = logging.getLogger(__name__)
 
 
 class Database:
-    """PostgreSQL database handler with temp table upsert."""
+    """PostgreSQL database handler with UNLOGGED staging tables for fast upsert."""
 
     def __init__(self, database_url: str):
         self.database_url = database_url
         self._pk_cache: dict = {}
+        self._index_cache: dict = {}
         self.conn = None
 
     def _parse_url(self) -> dict:
@@ -88,28 +89,180 @@ class Database:
             )
             self.conn.commit()
 
-    def bulk_upsert(self, df: pl.DataFrame, table_name: str, columns: List[str]):
-        """Bulk upsert using temp table + COPY."""
+    def set_bulk_load_config(self):
+        """Set PostgreSQL configuration for bulk loading performance."""
+        self.connect()
+        with self.conn.cursor() as cur:
+            cur.execute("SET maintenance_work_mem = '512MB'")
+            cur.execute("SET synchronous_commit = off")
+            # checkpoint_completion_target requires superuser, skip
+            logger.info("PostgreSQL bulk load configuration applied")
+
+    def reset_bulk_load_config(self):
+        """Reset PostgreSQL configuration to defaults."""
+        self.connect()
+        with self.conn.cursor() as cur:
+            cur.execute("RESET maintenance_work_mem")
+            cur.execute("RESET synchronous_commit")
+            logger.info("PostgreSQL configuration reset to defaults")
+
+    def get_table_indexes(self, table_name: str) -> List[dict]:
+        """Get all non-PK indexes for a table."""
+        if table_name in self._index_cache:
+            return self._index_cache[table_name]
+
+        self.connect()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT indexname, indexdef
+                FROM pg_indexes
+                WHERE tablename = %s
+                AND indexname NOT LIKE '%%_pkey'
+                """,
+                (table_name,),
+            )
+            indexes = [{"indexname": row[0], "indexdef": row[1]} for row in cur.fetchall()]
+            self._index_cache[table_name] = indexes
+            return indexes
+
+    def drop_indexes(self, table_name: str) -> List[dict]:
+        """Drop all non-PK indexes and return definitions for recreation."""
+        indexes = self.get_table_indexes(table_name)
+        if not indexes:
+            return []
+
+        self.connect()
+        with self.conn.cursor() as cur:
+            for idx in indexes:
+                cur.execute(f"DROP INDEX IF EXISTS {idx['indexname']}")
+            self.conn.commit()
+
+        logger.info(f"Dropped {len(indexes)} indexes from {table_name}")
+        return indexes
+
+    def create_indexes(self, indexes: List[dict]):
+        """Recreate indexes from saved definitions."""
+        if not indexes:
+            return
+
+        self.connect()
+        with self.conn.cursor() as cur:
+            for idx in indexes:
+                try:
+                    cur.execute(idx["indexdef"])
+                except psycopg2.Error as e:
+                    logger.warning(f"Failed to create index {idx['indexname']}: {e}")
+            self.conn.commit()
+
+        logger.info(f"Created {len(indexes)} indexes")
+
+    def drop_all_indexes_for_bulk_load(self) -> dict:
+        """Drop all non-PK indexes from large tables for bulk loading.
+
+        Returns dict of {table_name: [index_definitions]} for recreation.
+        """
+        large_tables = ["empresas", "estabelecimentos", "socios", "dados_simples"]
+        saved_indexes = {}
+
+        self.connect()
+        for table in large_tables:
+            indexes = self.get_table_indexes(table)
+            if indexes:
+                saved_indexes[table] = indexes
+                with self.conn.cursor() as cur:
+                    for idx in indexes:
+                        cur.execute(f"DROP INDEX IF EXISTS {idx['indexname']}")
+                    self.conn.commit()
+                logger.info(f"Dropped {len(indexes)} indexes from {table}")
+
+        # Clear cache since we dropped indexes
+        self._index_cache.clear()
+        return saved_indexes
+
+    def create_all_indexes_after_bulk_load(self, saved_indexes: dict):
+        """Recreate all indexes after bulk loading (with CONCURRENTLY option)."""
+        self.connect()
+        total = sum(len(idxs) for idxs in saved_indexes.values())
+        logger.info(f"Creating {total} indexes...")
+
+        for table, indexes in saved_indexes.items():
+            logger.info(f"Creating {len(indexes)} indexes on {table}...")
+            with self.conn.cursor() as cur:
+                for idx in indexes:
+                    try:
+                        # Use regular CREATE INDEX (CONCURRENTLY requires autocommit)
+                        cur.execute(idx["indexdef"])
+                        self.conn.commit()
+                        logger.info(f"  Created {idx['indexname']}")
+                    except psycopg2.Error as e:
+                        self.conn.rollback()
+                        logger.warning(f"  Failed {idx['indexname']}: {e}")
+
+        logger.info("All indexes created!")
+
+    def bulk_insert(self, df: pl.DataFrame, table_name: str, columns: List[str]):
+        """Ultra-fast bulk insert using COPY directly to table.
+
+        Use this for initial load when table is empty. No conflict handling.
+        Expected: 100k-200k rows/second.
+        """
         if df.is_empty():
             return
 
         self.connect()
-        temp_table = f"temp_{table_name}_{id(df)}"
+        try:
+            with self.conn.cursor() as cur:
+                columns_str = ", ".join([f'"{col}"' for col in columns])
+
+                # Write CSV and remove null bytes (0x00) that corrupt PostgreSQL COPY
+                csv_data = df.write_csv(include_header=False)
+                csv_data = csv_data.replace('\x00', '')  # Remove null bytes
+                buffer = io.StringIO(csv_data)
+
+                cur.copy_expert(
+                    f"COPY {table_name} ({columns_str}) FROM STDIN WITH CSV",
+                    buffer,
+                )
+                self.conn.commit()
+
+        except Exception as e:
+            self.conn.rollback()
+            logger.error(f"Error bulk_insert {table_name}: {e}")
+            raise
+
+    def bulk_upsert(self, df: pl.DataFrame, table_name: str, columns: List[str], use_unlogged: bool = True):
+        """Bulk upsert using UNLOGGED staging table + COPY.
+
+        Use this for incremental updates when table has existing data.
+        Slower than bulk_insert due to conflict handling.
+        """
+        if df.is_empty():
+            return
+
+        self.connect()
+        staging_table = f"staging_{table_name}_{id(df)}"
 
         try:
             with self.conn.cursor() as cur:
-                # 1. Create temp table
                 cur.execute(
-                    f"CREATE TEMP TABLE {temp_table} "
-                    f"(LIKE {table_name} INCLUDING DEFAULTS INCLUDING STORAGE) ON COMMIT DROP"
+                    f"CREATE UNLOGGED TABLE {staging_table} "
+                    f"(LIKE {table_name} INCLUDING DEFAULTS)"
                 )
 
-                # 2. COPY to temp
-                self._copy_to_temp(cur, df, temp_table, columns)
+                # COPY to staging (usando StringIO - mais rápido que BytesIO + encode)
+                columns_str = ", ".join([f'"{col}"' for col in columns])
+                buffer = io.StringIO()
+                df.write_csv(buffer, include_header=False)
+                buffer.seek(0)
+                cur.copy_expert(
+                    f"COPY {staging_table} ({columns_str}) FROM STDIN WITH CSV",
+                    buffer,
+                )
 
-                # 3. Upsert from temp to main
+                # Upsert from staging to main
                 primary_keys = self._get_primary_keys(cur, table_name)
-                self._upsert_from_temp(cur, temp_table, table_name, columns, primary_keys)
+                self._upsert_from_temp(cur, staging_table, table_name, columns, primary_keys)
 
                 self.conn.commit()
 
@@ -117,6 +270,13 @@ class Database:
             self.conn.rollback()
             logger.error(f"Error: {table_name}: {e}")
             raise
+        finally:
+            try:
+                with self.conn.cursor() as cur:
+                    cur.execute(f"DROP TABLE IF EXISTS {staging_table}")
+                    self.conn.commit()
+            except Exception:
+                pass
 
     def _copy_to_temp(self, cur, df: pl.DataFrame, temp_table: str, columns: List[str]):
         """COPY DataFrame to temp table using Polars CSV."""
