@@ -252,9 +252,9 @@ class Database:
 
                 # COPY to staging (usando StringIO - mais rápido que BytesIO + encode)
                 columns_str = ", ".join([f'"{col}"' for col in columns])
-                buffer = io.StringIO()
-                df.write_csv(buffer, include_header=False)
-                buffer.seek(0)
+                csv_data = df.write_csv(include_header=False)
+                csv_data = csv_data.replace('\x00', '')  # Remove null bytes que corrompem COPY
+                buffer = io.StringIO(csv_data)
                 cur.copy_expert(
                     f"COPY {staging_table} ({columns_str}) FROM STDIN WITH CSV",
                     buffer,

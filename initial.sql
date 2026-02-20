@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS motivos (
 CREATE TABLE IF NOT EXISTS municipios (
     codigo VARCHAR(7) PRIMARY KEY,
     descricao TEXT,
+    codigo_ibge VARCHAR(7),
+    uf VARCHAR(2),
     data_criacao TIMESTAMP DEFAULT NOW() NOT NULL,
     data_atualizacao TIMESTAMP DEFAULT NOW() NOT NULL
 );
@@ -100,6 +102,7 @@ CREATE TABLE IF NOT EXISTS estabelecimentos (
 );
 
 CREATE TABLE IF NOT EXISTS socios (
+    id SERIAL PRIMARY KEY,
     cnpj_basico VARCHAR(8) NOT NULL,
     identificador_de_socio VARCHAR(1) NOT NULL,
     nome_socio TEXT,
@@ -112,8 +115,7 @@ CREATE TABLE IF NOT EXISTS socios (
     qualificacao_do_representante_legal VARCHAR(2),
     faixa_etaria VARCHAR(1),
     data_criacao TIMESTAMP DEFAULT NOW() NOT NULL,
-    data_atualizacao TIMESTAMP DEFAULT NOW() NOT NULL,
-    PRIMARY KEY (cnpj_basico, identificador_de_socio, cnpj_cpf_do_socio)
+    data_atualizacao TIMESTAMP DEFAULT NOW() NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS dados_simples (

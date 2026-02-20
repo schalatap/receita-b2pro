@@ -32,8 +32,8 @@ ES_USER = os.getenv('ES_USER', 'elastic')
 ES_PASS = os.getenv('ES_PASS', '=6npk3H78C+OWEfpyd1u')
 INDEX_NAME = 'empresas_b2b'
 
-BATCH_SIZE = 15000
-ES_CHUNK = 2500
+BATCH_SIZE = 5000
+ES_CHUNK = 1000
 
 PORTE = {'00': 'Não Informado', '01': 'Micro Empresa', '03': 'EPP', '05': 'Demais'}
 SITUACAO = {'01': 'Nula', '02': 'Ativa', '03': 'Suspensa', '04': 'Inapta', '08': 'Baixada'}
@@ -90,13 +90,33 @@ SELECT
     ds.opcao_pelo_simples,
     ds.opcao_pelo_mei,
     ds.data_opcao_pelo_simples,
-    ds.data_opcao_pelo_mei
+    ds.data_opcao_pelo_mei,
+    -- Dados IBGE
+    ibge.populacao as municipio_populacao,
+    ibge.regiao_nome as municipio_regiao,
+    ibge.mesorregiao_nome as municipio_mesorregiao,
+    ibge.microrregiao_nome as municipio_microrregiao,
+    ibge.capital as municipio_capital,
+    ibge.latitude as municipio_lat,
+    ibge.longitude as municipio_lon,
+    -- PGFN (Dívida Ativa)
+    pgfn.divida_total as pgfn_divida_total,
+    pgfn.qtd_inscricoes as pgfn_qtd_inscricoes,
+    pgfn.qtd_ajuizadas as pgfn_qtd_ajuizadas,
+    -- CVM (Capital Aberto)
+    cvm_ind.cnpj_basico IS NOT NULL as cvm_capital_aberto,
+    cvm_ind.setor_atividade as cvm_setor,
+    cvm_ind.receita_liquida as cvm_receita,
+    cvm_ind.lucro_liquido as cvm_lucro
 FROM estabelecimentos e
 JOIN empresas emp ON e.cnpj_basico = emp.cnpj_basico
 LEFT JOIN cnaes c ON e.cnae_fiscal_principal = c.codigo
 LEFT JOIN naturezas_juridicas nj ON emp.natureza_juridica = nj.codigo
 LEFT JOIN municipios m ON e.municipio = m.codigo
+LEFT JOIN enrich.ibge_municipios ibge ON ibge.codigo_ibge = m.codigo_ibge
 LEFT JOIN dados_simples ds ON e.cnpj_basico = ds.cnpj_basico
+LEFT JOIN enrich.pgfn_empresas_mat pgfn ON pgfn.cnpj_basico = e.cnpj_basico
+LEFT JOIN enrich.cvm_lookup cvm_ind ON cvm_ind.cnpj_basico = e.cnpj_basico
 WHERE e.situacao_cadastral = '02'
   AND e.identificador_matriz_filial = '1'
   AND e.cnpj_basico > %s
@@ -133,10 +153,19 @@ def fetch_socios(conn, cnpjs):
     return dict(result)
 
 
-def transform(row, socios):
+def transform(row, socios, index_name=INDEX_NAME):
     capital = float(row['capital_social']) if row['capital_social'] else 0
+
+    # Coordenadas para geo_point (se disponíveis)
+    location = None
+    if row['municipio_lat'] and row['municipio_lon']:
+        location = {
+            'lat': float(row['municipio_lat']),
+            'lon': float(row['municipio_lon'])
+        }
+
     return {
-        '_index': INDEX_NAME,
+        '_index': index_name,
         '_id': row['cnpj'],
         '_source': {
             'cnpj': row['cnpj'],
@@ -183,11 +212,28 @@ def transform(row, socios):
             },
             'socios': socios,
             'qtd_socios': len(socios),
+            # Dados IBGE
+            'municipio_populacao': row['municipio_populacao'],
+            'municipio_regiao': row['municipio_regiao'],
+            'municipio_mesorregiao': row['municipio_mesorregiao'],
+            'municipio_microrregiao': row['municipio_microrregiao'],
+            'municipio_capital': row['municipio_capital'] or False,
+            'location': location,
+            # PGFN
+            'tem_divida_ativa': bool(row.get('pgfn_divida_total') and float(row['pgfn_divida_total']) > 0),
+            'divida_total': float(row['pgfn_divida_total']) if row.get('pgfn_divida_total') else None,
+            'qtd_inscricoes_pgfn': row.get('pgfn_qtd_inscricoes') or 0,
+            'qtd_ajuizadas_pgfn': row.get('pgfn_qtd_ajuizadas') or 0,
+            # CVM
+            'empresa_capital_aberto': bool(row.get('cvm_capital_aberto')),
+            'setor_cvm': row.get('cvm_setor'),
+            'receita_liquida': float(row['cvm_receita']) if row.get('cvm_receita') else None,
+            'lucro_liquido': float(row['cvm_lucro']) if row.get('cvm_lucro') else None,
         }
     }
 
 
-def generate_docs(conn):
+def generate_docs(conn, index_name=INDEX_NAME):
     with conn.cursor() as cur:
         cur.execute("""
             SELECT COUNT(*) FROM estabelecimentos
@@ -213,7 +259,7 @@ def generate_docs(conn):
 
         for row in rows:
             socios = socios_map.get(row['cnpj_basico'], [])
-            yield transform(row, socios)
+            yield transform(row, socios, index_name)
             processed += 1
 
         last_cnpj = rows[-1]['cnpj_basico']
@@ -225,7 +271,7 @@ def generate_docs(conn):
     logger.info(f"Total: {processed:,}")
 
 
-def create_index(es):
+def create_index(es, index_name=INDEX_NAME):
     mapping = {
         "settings": {
             "number_of_shards": 3,
@@ -304,12 +350,78 @@ def create_index(es):
                         "data_entrada": {"type": "date", "format": "yyyy-MM-dd"}
                     }
                 },
-                "qtd_socios": {"type": "integer"}
+                "qtd_socios": {"type": "integer"},
+                "municipio_populacao": {"type": "integer"},
+                "municipio_regiao": {"type": "keyword"},
+                "municipio_mesorregiao": {"type": "keyword"},
+                "municipio_microrregiao": {"type": "keyword"},
+                "municipio_capital": {"type": "boolean"},
+                "location": {"type": "geo_point"},
+                "tem_divida_ativa": {"type": "boolean"},
+                "divida_total": {"type": "double"},
+                "qtd_inscricoes_pgfn": {"type": "integer"},
+                "qtd_ajuizadas_pgfn": {"type": "integer"},
+                "empresa_capital_aberto": {"type": "boolean"},
+                "setor_cvm": {"type": "keyword"},
+                "receita_liquida": {"type": "double"},
+                "lucro_liquido": {"type": "double"}
             }
         }
     }
-    es.indices.create(index=INDEX_NAME, body=mapping)
-    logger.info(f"Índice '{INDEX_NAME}' criado")
+    es.indices.create(index=index_name, body=mapping)
+    logger.info(f"Índice '{index_name}' criado")
+
+
+ALIAS_NAME = INDEX_NAME  # 'empresas_b2b' é o alias que a API consulta
+
+
+def prepare_enrich_tables(conn):
+    """Popula tabelas materializadas de enriquecimento usadas nos JOINs do sync."""
+    logger.info("Populando tabelas de enriquecimento...")
+    with conn.cursor() as cur:
+        # pgfn_empresas_mat — cópia materializada da view pgfn_empresas
+        cur.execute("TRUNCATE TABLE enrich.pgfn_empresas_mat")
+        cur.execute("""
+            INSERT INTO enrich.pgfn_empresas_mat
+            SELECT * FROM enrich.pgfn_empresas
+        """)
+        pgfn_count = cur.rowcount
+        conn.commit()
+        logger.info(f"  pgfn_empresas_mat: {pgfn_count:,} rows")
+
+        # cvm_lookup — consolidação de companhias abertas com indicadores mais recentes
+        cur.execute("TRUNCATE TABLE enrich.cvm_lookup")
+        cur.execute("""
+            INSERT INTO enrich.cvm_lookup (cnpj_basico, setor_atividade, receita_liquida, lucro_liquido)
+            SELECT
+                LEFT(c.cnpj_limpo, 8) AS cnpj_basico,
+                c.setor_atividade,
+                i.receita_liquida,
+                i.lucro_liquido
+            FROM enrich.cvm_companhias c
+            LEFT JOIN enrich.cvm_indicadores i ON i.cnpj_limpo = c.cnpj_limpo
+                AND i.ano_referencia = (
+                    SELECT MAX(ano_referencia) FROM enrich.cvm_indicadores ci
+                    WHERE ci.cnpj_limpo = c.cnpj_limpo
+                )
+        """)
+        cvm_count = cur.rowcount
+        conn.commit()
+        logger.info(f"  cvm_lookup: {cvm_count:,} rows")
+
+
+def vacuum_analyze(database_url):
+    """Executa VACUUM ANALYZE nas tabelas principais (requer autocommit)."""
+    logger.info("Executando VACUUM ANALYZE...")
+    conn = psycopg2.connect(database_url)
+    conn.autocommit = True
+    tables = ['empresas', 'estabelecimentos', 'socios', 'dados_simples', 'municipios']
+    with conn.cursor() as cur:
+        for table in tables:
+            logger.info(f"  VACUUM ANALYZE {table}...")
+            cur.execute(f"VACUUM ANALYZE {table}")
+    conn.close()
+    logger.info("VACUUM ANALYZE concluído")
 
 
 def main():
@@ -323,10 +435,21 @@ def main():
         sys.exit(1)
     logger.info(f"Elasticsearch {es.info()['version']['number']}")
 
-    if es.indices.exists(index=INDEX_NAME):
-        es.indices.delete(index=INDEX_NAME)
-    create_index(es)
+    # 1. Preparar tabelas de enriquecimento
+    prep_conn = psycopg2.connect(DATABASE_URL)
+    prepare_enrich_tables(prep_conn)
+    prep_conn.close()
 
+    # 2. VACUUM ANALYZE para estatísticas atualizadas
+    vacuum_analyze(DATABASE_URL)
+
+    # 3. Criar índice temporário com timestamp (alias swap = zero downtime)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    new_index = f"{ALIAS_NAME}_{timestamp}"
+    create_index(es, new_index)
+    logger.info(f"Índice temporário: {new_index}")
+
+    # 4. Indexar documentos
     conn = psycopg2.connect(DATABASE_URL)
     conn.set_session(readonly=True)
     logger.info("PostgreSQL conectado")
@@ -336,7 +459,7 @@ def main():
     success, failed = 0, 0
 
     for ok, result in streaming_bulk(
-        es, generate_docs(conn),
+        es, generate_docs(conn, new_index),
         chunk_size=ES_CHUNK,
         raise_on_error=False,
         raise_on_exception=False
@@ -349,23 +472,59 @@ def main():
                 logger.warning(f"Erro: {result}")
 
     elapsed = datetime.now() - start
+    conn.close()
 
-    es.indices.refresh(index=INDEX_NAME)
-    es.indices.put_settings(index=INDEX_NAME, body={"refresh_interval": "30s"})
+    # 5. Finalizar índice
+    es.indices.refresh(index=new_index)
+    es.indices.put_settings(index=new_index, body={"refresh_interval": "30s"})
 
-    stats = es.indices.stats(index=INDEX_NAME)['indices'][INDEX_NAME]['primaries']
+    stats = es.indices.stats(index=new_index)['indices'][new_index]['primaries']
+    doc_count = stats['docs']['count']
+
+    # 6. Validar antes do swap (proteção contra índice vazio)
+    if doc_count < 1000:
+        logger.error(f"Apenas {doc_count} docs indexados — abortando swap (mínimo 1000)")
+        es.indices.delete(index=new_index)
+        sys.exit(1)
+
+    # 7. Alias swap atômico
+    old_indices = []
+    if es.indices.exists_alias(name=ALIAS_NAME):
+        alias_info = es.indices.get_alias(name=ALIAS_NAME)
+        old_indices = list(alias_info.keys())
+
+    actions = [{"add": {"index": new_index, "alias": ALIAS_NAME}}]
+    for old_idx in old_indices:
+        actions.append({"remove": {"index": old_idx, "alias": ALIAS_NAME}})
+
+    # Se o alias não existe e um índice com o mesmo nome existe (migração do formato antigo)
+    if not es.indices.exists_alias(name=ALIAS_NAME) and es.indices.exists(index=ALIAS_NAME):
+        logger.info(f"Migrando de índice direto para alias: deletando índice '{ALIAS_NAME}'")
+        old_indices = [ALIAS_NAME]
+        es.indices.delete(index=ALIAS_NAME)
+        actions = [{"add": {"index": new_index, "alias": ALIAS_NAME}}]
+
+    es.indices.update_aliases(body={"actions": actions})
+    logger.info(f"Alias '{ALIAS_NAME}' → '{new_index}'")
+
+    # 8. Limpar índices antigos
+    for old_idx in old_indices:
+        if old_idx != new_index:
+            try:
+                es.indices.delete(index=old_idx)
+                logger.info(f"Índice antigo '{old_idx}' removido")
+            except Exception as e:
+                logger.warning(f"Falha ao remover índice antigo '{old_idx}': {e}")
 
     logger.info("=" * 60)
     logger.info("CONCLUÍDO")
-    logger.info(f"Docs: {stats['docs']['count']:,}")
+    logger.info(f"Docs: {doc_count:,}")
     logger.info(f"Size: {stats['store']['size_in_bytes']/1024/1024/1024:.2f} GB")
     logger.info(f"Time: {elapsed}")
     logger.info(f"Speed: {success/elapsed.total_seconds():.0f} docs/s")
     if failed:
         logger.warning(f"Failed: {failed:,}")
     logger.info("=" * 60)
-
-    conn.close()
 
 
 if __name__ == '__main__':
