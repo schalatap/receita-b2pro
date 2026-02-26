@@ -399,10 +399,10 @@ def prepare_enrich_tables(conn):
                 i.receita_liquida,
                 i.lucro_liquido
             FROM enrich.cvm_companhias c
-            LEFT JOIN enrich.cvm_indicadores i ON i.cnpj_limpo = c.cnpj_limpo
-                AND i.ano_referencia = (
-                    SELECT MAX(ano_referencia) FROM enrich.cvm_indicadores ci
-                    WHERE ci.cnpj_limpo = c.cnpj_limpo
+            LEFT JOIN enrich.cvm_indicadores i ON i.codigo_cvm = c.codigo_cvm
+                AND i.ano_exercicio = (
+                    SELECT MAX(ano_exercicio) FROM enrich.cvm_indicadores ci
+                    WHERE ci.codigo_cvm = c.codigo_cvm
                 )
         """)
         cvm_count = cur.rowcount
