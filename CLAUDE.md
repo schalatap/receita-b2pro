@@ -6,7 +6,7 @@ ETL para ingestão de dados de empresas brasileiras da Receita Federal em Postgr
 
 Este projeto faz parte de uma **plataforma de Inteligência Comercial B2B** para competir com Speedio, Econodata e Leads2b. O pipeline é responsável por:
 
-1. Download dos dados abertos da Receita Federal (~20GB/mês)
+1. Download dos dados abertos da Receita Federal (~7GB/mês compactados) via WebDAV
 2. Processamento e transformação com Polars
 3. Carga em PostgreSQL com estratégia de UPSERT
 4. Base para enriquecimentos futuros (validação de contatos, decisores, tecnologias)
@@ -46,8 +46,8 @@ cnpj-data-pipeline/
 2. Downloader busca meses disponíveis na RFB
 3. Database verifica arquivos já processados (idempotência)
 4. Download em paralelo (4 workers) com retry
-5. Processamento em batches (50k linhas) com Polars
-6. UPSERT via COPY + temp table + ON CONFLICT
+5. Processamento em batches (500k linhas) com Polars
+6. UPSERT via COPY + UNLOGGED staging table + ON CONFLICT
 7. Marca arquivo como processado
 ```
 
@@ -75,10 +75,11 @@ PROCESSING_ORDER = [
 - `parse_args()` - CLI arguments
 - `get_file_priority()` - Ordenação por dependências FK
 
-### downloader.py (202 linhas)
-- `get_available_directories()` - Scrape HTML da RFB para listar meses
-- `get_directory_files()` - Lista ZIPs de um mês
-- `download_files()` - Download paralelo com ThreadPoolExecutor
+### downloader.py (~220 linhas)
+- `_propfind()` - WebDAV PROPFIND no Nextcloud da RFB (substituiu scraping HTML)
+- `get_available_directories()` - Lista meses via WebDAV XML parsing
+- `get_directory_files()` - Lista ZIPs de um mês via WebDAV
+- `download_files()` - Download paralelo com ThreadPoolExecutor (auth por share token)
 - `_download_and_extract()` - Download com retry + extração ZIP
 
 ### processor.py (209 linhas)
@@ -162,11 +163,51 @@ just run --month 2024-11
 5. **Qualidade** - Validações, integridade referencial
 6. **CNPJ 2026** - Suporte a CNPJ alfanumérico (julho/2026)
 
+## Relacionamento com Upstream
+
+Este repositório é um fork de [`caiopizzol/cnpj-data-pipeline`](https://github.com/caiopizzol/cnpj-data-pipeline).
+
+**Ponto de divergência:** commit `29dfeb8` (chore: long lived container).
+
+### Nossas modificações (preservar sempre)
+
+| Arquivo | O que fizemos | Por que |
+|---------|--------------|---------|
+| `main.py` | `--initial-load`, DROP/CREATE índices, `set_bulk_load_config()`, `raise` em erros | Performance 2-3x melhor que upstream |
+| `database.py` | `bulk_insert()`, UNLOGGED staging, StringIO, null byte fix, gerenciamento de índices | Carga em massa otimizada |
+| `processor.py` | Leitura ISO-8859-1 nativa (sem conversão UTF-8), batch 500k | -50% I/O, -90% commits |
+| `sync_elasticsearch.py` | Arquivo nosso (não existe no upstream) | Sync PG -> ES com alias swap |
+| `scripts/enrich/` | Diretório nosso (não existe no upstream) | Scripts de enriquecimento |
+
+### Commits cherry-picked do upstream
+
+| Data | Commit | Descrição |
+|------|--------|-----------|
+| 2026-02-09 | `b1cd64a` | fix: adjust downloader to new url (WebDAV) |
+
+### Como sincronizar com upstream
+
+```bash
+cd /home/akira/cnpj-data-pipeline
+git fetch upstream
+# Avaliar novos commits:
+git log --oneline upstream/main..HEAD   # nossos commits
+git log --oneline HEAD..upstream/main   # commits novos do upstream
+# Cherry-pick seletivo (NÃO merge/rebase — upstream reverte nossas otimizações):
+git cherry-pick <commit-sha>
+```
+
+> **NUNCA fazer merge ou rebase do upstream inteiro.** O upstream não tem nossas otimizações
+> de performance (`bulk_insert`, UNLOGGED staging, `--initial-load`, DROP índices).
+> Fazer merge/rebase reverteria essas mudanças. Usar sempre **cherry-pick seletivo**.
+
+---
+
 ## Limitações Conhecidas
 
 - **Memória**: `low_memory=False` no Polars pode consumir muita RAM
 - **Sem checkpoint por batch**: Falha em batch N reprocessa arquivo inteiro
-- **Regex frágil**: Parsing HTML da RFB pode quebrar com mudanças
+- **Share token frágil**: Se a RFB mudar o token Nextcloud, o download quebra (verificar mirror Casa dos Dados)
 - **Processamento sequencial**: Download paralelo, mas processamento é serial
 
 ## Contexto da Plataforma B2B
@@ -183,10 +224,35 @@ Ver documentação completa em `/home/akira/CLAUDE.md` (projeto global).
 
 ## Fonte de Dados
 
-- **URL**: https://dados.gov.br/dados/conjuntos-dados/cadastro-nacional-da-pessoa-juridica---cnpj
+- **Portal gov.br**: https://dados.gov.br/dados/conjuntos-dados/cadastro-nacional-da-pessoa-juridica---cnpj
+- **Repositório oficial (Nextcloud/SERPRO+)**: https://arquivos.receitafederal.gov.br/index.php/s/YggdBLfdninEJX9
+- **Mirror rápido (Casa dos Dados/Cloudflare)**: https://dados-abertos-rf-cnpj.casadosdados.com.br/arquivos/
+- **Metadados dos arquivos**: https://www.gov.br/receitafederal/dados/cnpj-metadados.pdf
 - **Atualização**: Mensal (~2ª semana do mês)
-- **Volume**: ~20GB compactados, ~60M CNPJs
+- **Volume**: ~7 GB compactados (37 ZIPs), ~21 GB descomprimidos, ~60M CNPJs
 - **Latência**: 30-45 dias entre alteração na empresa e publicação
+
+### Migração da URL da RFB (Fev/2026)
+
+Em janeiro/2026 a RFB migrou os arquivos de uma listagem de diretório HTTP para um
+**compartilhamento Nextcloud (SERPRO+)**. A URL antiga parou de funcionar:
+
+```
+ANTES (quebrado): https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/
+AGORA (funciona): https://arquivos.receitafederal.gov.br/public.php/webdav/  (via WebDAV)
+```
+
+O acesso programático é feito via **WebDAV PROPFIND** com autenticação por share token:
+- `base_url`: `https://arquivos.receitafederal.gov.br/public.php/webdav`
+- `auth`: `(share_token, "")` onde `share_token = "YggdBLfdninEJX9"`
+
+**Abordagem adotada:** Cherry-pick do commit `b1cd64a` do upstream (`caiopizzol/cnpj-data-pipeline`
+v1.3.2) que migra `config.py` e `downloader.py` de scraping HTML para WebDAV. Os demais commits
+do upstream (docs, versão, lefthook) foram ignorados por não serem relevantes. Nossas otimizações
+de performance em `main.py`, `database.py` e `processor.py` foram preservadas intactas.
+
+> **ATENÇÃO:** A RFB muda a URL dos dados periodicamente sem aviso. Se o download quebrar,
+> verificar: (1) se o share token mudou no portal gov.br, (2) se a Casa dos Dados tem mirror atualizado.
 
 ---
 
