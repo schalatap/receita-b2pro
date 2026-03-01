@@ -87,6 +87,7 @@ SELECT
     CASE WHEN e.ddd_2 IS NOT NULL AND e.telefone_2 IS NOT NULL
          THEN e.ddd_2 || e.telefone_2 END as telefone_2,
     e.correio_eletronico as email,
+    e.identificador_matriz_filial,
     ds.opcao_pelo_simples,
     ds.opcao_pelo_mei,
     ds.data_opcao_pelo_simples,
@@ -117,10 +118,11 @@ LEFT JOIN enrich.ibge_municipios ibge ON ibge.codigo_ibge = m.codigo_ibge
 LEFT JOIN dados_simples ds ON e.cnpj_basico = ds.cnpj_basico
 LEFT JOIN enrich.pgfn_empresas_mat pgfn ON pgfn.cnpj_basico = e.cnpj_basico
 LEFT JOIN enrich.cvm_lookup cvm_ind ON cvm_ind.cnpj_basico = e.cnpj_basico
-WHERE e.situacao_cadastral = '02'
-  AND e.identificador_matriz_filial = '1'
-  AND e.cnpj_basico > %s
-ORDER BY e.cnpj_basico
+WHERE (e.situacao_cadastral IN ('02', '03', '04')
+   OR (e.situacao_cadastral = '08'
+       AND e.data_situacao_cadastral >= CURRENT_DATE - INTERVAL '2 years'))
+  AND (e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv) > (%s, %s, %s)
+ORDER BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv
 LIMIT %s
 """
 
@@ -186,7 +188,7 @@ def transform(row, socios, index_name=INDEX_NAME):
             'porte_descricao': PORTE.get(row['porte']),
             'capital_social': capital,
             'faixa_capital': faixa_capital(capital),
-            'matriz_filial': 'Matriz',
+            'matriz_filial': 'Matriz' if row['identificador_matriz_filial'] == '1' else 'Filial',
             'endereco': {
                 'logradouro': f"{row['tipo_logradouro'] or ''} {row['logradouro'] or ''}".strip(),
                 'numero': row['numero'],
@@ -236,33 +238,41 @@ def transform(row, socios, index_name=INDEX_NAME):
 def generate_docs(conn, index_name=INDEX_NAME):
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT COUNT(*) FROM estabelecimentos
-            WHERE situacao_cadastral = '02' AND identificador_matriz_filial = '1'
+            SELECT COUNT(*) FROM estabelecimentos e
+            WHERE (e.situacao_cadastral IN ('02', '03', '04')
+               OR (e.situacao_cadastral = '08'
+                   AND e.data_situacao_cadastral >= CURRENT_DATE - INTERVAL '2 years'))
         """)
         total = cur.fetchone()[0]
 
-    logger.info(f"Total: {total:,} empresas")
+    logger.info(f"Total: {total:,} estabelecimentos")
 
-    last_cnpj = ''
+    last_basico, last_ordem, last_dv = '', '', ''
     processed = 0
 
     while True:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(QUERY_EMPRESAS, (last_cnpj, BATCH_SIZE))
+            cur.execute(QUERY_EMPRESAS, (last_basico, last_ordem, last_dv, BATCH_SIZE))
             rows = cur.fetchall()
 
         if not rows:
             break
 
-        cnpjs = [r['cnpj_basico'] for r in rows]
-        socios_map = fetch_socios(conn, cnpjs)
+        # Sócios são por cnpj_basico (empresa raiz), não por estabelecimento
+        cnpjs_basicos = list({r['cnpj_basico'] for r in rows})
+        socios_map = fetch_socios(conn, cnpjs_basicos)
 
         for row in rows:
             socios = socios_map.get(row['cnpj_basico'], [])
             yield transform(row, socios, index_name)
             processed += 1
 
-        last_cnpj = rows[-1]['cnpj_basico']
+        # Avançar cursor pela PK composta do último registro
+        last_row = rows[-1]
+        last_basico = last_row['cnpj_basico']
+        # Extrair cnpj_ordem e cnpj_dv do cnpj completo (basico 8 + ordem 4 + dv 2)
+        last_ordem = last_row['cnpj'][8:12]
+        last_dv = last_row['cnpj'][12:14]
 
         if processed % 100000 == 0:
             pct = 100 * processed / total
