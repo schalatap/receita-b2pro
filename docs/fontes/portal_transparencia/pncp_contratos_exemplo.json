@@ -1,0 +1,57 @@
+{
+  "numeroControlePncpCompra": "16888315000157-1-000057/2023",
+  "codigoPaisFornecedor": "BRA",
+  "orgaoEntidade": {
+    "cnpj": "16888315000157",
+    "razaoSocial": "UNIVERSIDADE FEDERAL DOS VALES DO JEQUITINHONHA E MUCURI",
+    "poderId": "E",
+    "esferaId": "F"
+  },
+  "dataAssinatura": "2023-12-29",
+  "dataVigenciaInicio": "2023-12-29",
+  "dataVigenciaFim": "2023-12-31",
+  "niFornecedor": "45769285000168",
+  "tipoPessoa": "PJ",
+  "processo": "23086.019182/2023-90",
+  "orgaoSubRogado": null,
+  "unidadeOrgao": {
+    "ufNome": "Minas Gerais",
+    "codigoUnidade": "153036",
+    "ufSigla": "MG",
+    "municipioNome": "Diamantina",
+    "nomeUnidade": "UNIV.FED.DOS VALES DO JEQUITINHONHA E MUCURI",
+    "codigoIbge": "3121605"
+  },
+  "unidadeSubRogada": null,
+  "nomeRazaoSocialFornecedor": "REDNOV FERRAMENTAS LTDA.",
+  "informacaoComplementar": "15303605000392023 - UASG Minuta: 153036",
+  "numeroContratoEmpenho": "2023NE001786",
+  "categoriaProcesso": {
+    "id": 8,
+    "nome": "Serviços"
+  },
+  "anoContrato": 2023,
+  "tipoContrato": {
+    "id": 7,
+    "nome": "Empenho"
+  },
+  "sequencialContrato": 637,
+  "dataAtualizacao": "2024-01-01T00:00:03",
+  "dataPublicacaoPncp": "2024-01-01T00:00:02",
+  "niFornecedorSubContratado": null,
+  "nomeFornecedorSubContratado": null,
+  "usuarioNome": "Contratos.gov.br",
+  "dataAtualizacaoGlobal": "2025-06-18T14:09:12",
+  "numeroControlePNCP": "16888315000157-2-000637/2023",
+  "receita": false,
+  "numeroParcelas": 1,
+  "numeroRetificacao": 0,
+  "tipoPessoaSubContratada": null,
+  "objetoContrato": "AQUISIÇÃO DE EQUIPAMENTOS PARA ATENDER A DEMANDA FACULDADE DE CIENCIAS AGRÁRIAS. HAVENDO DIVERGÊNCIA ENTRE A DESCRIÇÃO QUE CONSTA NO EMPENHO (CATMAT) E O TERMO DE REFERÊNCIA, PREVALECERÁ ESTE ÚLTIMO. TED 12657/2023. TRANSFERENCIA 1AAOHJ. ND: 2550.",
+  "valorInicial": 5512.28,
+  "valorParcela": 5512.28,
+  "valorGlobal": 5512.28,
+  "valorAcumulado": 5512.28,
+  "identificadorCipi": null,
+  "urlCipi": null
+}
