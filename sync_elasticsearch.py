@@ -5,19 +5,24 @@ Sync PostgreSQL → Elasticsearch.
 Otimizações aplicadas:
 - Keyset pagination (sem OFFSET lento)
 - Sócios em batch com ANY()
-- Batch sizes otimizados
+- Multiprocessing: N workers dividem o keyspace do CNPJ
+- parallel_bulk: 2 threads por worker para envio ao ES
+- Batch sizes otimizados (20k PG, 3k ES)
+- translog.durability=async durante bulk
 """
 
 import logging
 import os
 import sys
+import time
 from datetime import datetime
 from collections import defaultdict
+from multiprocessing import Process, Value
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from elasticsearch import Elasticsearch
-from elasticsearch.helpers import streaming_bulk
+from elasticsearch.helpers import parallel_bulk
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -32,8 +37,10 @@ ES_USER = os.getenv('ES_USER', 'elastic')
 ES_PASS = os.getenv('ES_PASS', '=6npk3H78C+OWEfpyd1u')
 INDEX_NAME = 'empresas_b2b'
 
-BATCH_SIZE = 5000
-ES_CHUNK = 1000
+NUM_WORKERS = int(os.getenv('SYNC_WORKERS', '4'))
+BATCH_SIZE = 20000
+ES_CHUNK = 3000
+BULK_THREADS = 2  # threads por worker para parallel_bulk
 
 PORTE = {'00': 'Não Informado', '01': 'Micro Empresa', '03': 'EPP', '05': 'Demais'}
 SITUACAO = {'01': 'Nula', '02': 'Ativa', '03': 'Suspensa', '04': 'Inapta', '08': 'Baixada'}
@@ -121,6 +128,7 @@ LEFT JOIN enrich.cvm_lookup cvm_ind ON cvm_ind.cnpj_basico = e.cnpj_basico
 WHERE (e.situacao_cadastral IN ('02', '03', '04')
    OR (e.situacao_cadastral = '08'
        AND e.data_situacao_cadastral >= CURRENT_DATE - INTERVAL '2 years'))
+  AND e.cnpj_basico >= %s AND e.cnpj_basico < %s
   AND (e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv) > (%s, %s, %s)
 ORDER BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv
 LIMIT %s
@@ -155,10 +163,9 @@ def fetch_socios(conn, cnpjs):
     return dict(result)
 
 
-def transform(row, socios, index_name=INDEX_NAME):
+def transform(row, socios, index_name):
     capital = float(row['capital_social']) if row['capital_social'] else 0
 
-    # Coordenadas para geo_point (se disponíveis)
     location = None
     if row['municipio_lat'] and row['municipio_lon']:
         location = {
@@ -188,7 +195,7 @@ def transform(row, socios, index_name=INDEX_NAME):
             'porte_descricao': PORTE.get(row['porte']),
             'capital_social': capital,
             'faixa_capital': faixa_capital(capital),
-            'matriz_filial': 'Matriz' if row['identificador_matriz_filial'] == '1' else 'Filial',
+            'matriz_filial': 'Matriz' if str(row['identificador_matriz_filial']) == '1' else 'Filial',
             'endereco': {
                 'logradouro': f"{row['tipo_logradouro'] or ''} {row['logradouro'] or ''}".strip(),
                 'numero': row['numero'],
@@ -214,19 +221,16 @@ def transform(row, socios, index_name=INDEX_NAME):
             },
             'socios': socios,
             'qtd_socios': len(socios),
-            # Dados IBGE
             'municipio_populacao': row['municipio_populacao'],
             'municipio_regiao': row['municipio_regiao'],
             'municipio_mesorregiao': row['municipio_mesorregiao'],
             'municipio_microrregiao': row['municipio_microrregiao'],
             'municipio_capital': row['municipio_capital'] or False,
             'location': location,
-            # PGFN
             'tem_divida_ativa': bool(row.get('pgfn_divida_total') and float(row['pgfn_divida_total']) > 0),
             'divida_total': float(row['pgfn_divida_total']) if row.get('pgfn_divida_total') else None,
             'qtd_inscricoes_pgfn': row.get('pgfn_qtd_inscricoes') or 0,
             'qtd_ajuizadas_pgfn': row.get('pgfn_qtd_ajuizadas') or 0,
-            # CVM
             'empresa_capital_aberto': bool(row.get('cvm_capital_aberto')),
             'setor_cvm': row.get('cvm_setor'),
             'receita_liquida': float(row['cvm_receita']) if row.get('cvm_receita') else None,
@@ -235,50 +239,86 @@ def transform(row, socios, index_name=INDEX_NAME):
     }
 
 
-def generate_docs(conn, index_name=INDEX_NAME):
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT COUNT(*) FROM estabelecimentos e
-            WHERE (e.situacao_cadastral IN ('02', '03', '04')
-               OR (e.situacao_cadastral = '08'
-                   AND e.data_situacao_cadastral >= CURRENT_DATE - INTERVAL '2 years'))
-        """)
-        total = cur.fetchone()[0]
-
-    logger.info(f"Total: {total:,} estabelecimentos")
-
+def generate_docs(conn, range_start, range_end, index_name, counter):
+    """Gera documentos ES para uma faixa do keyspace CNPJ."""
     last_basico, last_ordem, last_dv = '', '', ''
-    processed = 0
 
     while True:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(QUERY_EMPRESAS, (last_basico, last_ordem, last_dv, BATCH_SIZE))
+            cur.execute(QUERY_EMPRESAS, (range_start, range_end, last_basico, last_ordem, last_dv, BATCH_SIZE))
             rows = cur.fetchall()
 
         if not rows:
             break
 
-        # Sócios são por cnpj_basico (empresa raiz), não por estabelecimento
         cnpjs_basicos = list({r['cnpj_basico'] for r in rows})
         socios_map = fetch_socios(conn, cnpjs_basicos)
 
         for row in rows:
             socios = socios_map.get(row['cnpj_basico'], [])
             yield transform(row, socios, index_name)
-            processed += 1
 
-        # Avançar cursor pela PK composta do último registro
+        with counter.get_lock():
+            counter.value += len(rows)
+
         last_row = rows[-1]
         last_basico = last_row['cnpj_basico']
-        # Extrair cnpj_ordem e cnpj_dv do cnpj completo (basico 8 + ordem 4 + dv 2)
         last_ordem = last_row['cnpj'][8:12]
         last_dv = last_row['cnpj'][12:14]
 
-        if processed % 100000 == 0:
-            pct = 100 * processed / total
-            logger.info(f"Processados: {processed:,} / {total:,} ({pct:.1f}%)")
 
-    logger.info(f"Total: {processed:,}")
+def worker_process(worker_id, range_start, range_end, index_name, counter):
+    """Worker: indexa uma faixa do keyspace CNPJ."""
+    logger.info(f"Worker {worker_id}: cnpj_basico [{range_start}, {range_end})")
+
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.set_session(readonly=True)
+    es = Elasticsearch(ES_HOST, basic_auth=(ES_USER, ES_PASS), verify_certs=False)
+
+    success, failed = 0, 0
+    for ok, result in parallel_bulk(
+        es, generate_docs(conn, range_start, range_end, index_name, counter),
+        chunk_size=ES_CHUNK,
+        thread_count=BULK_THREADS,
+        raise_on_error=False,
+        raise_on_exception=False,
+    ):
+        if ok:
+            success += 1
+        else:
+            failed += 1
+            if failed <= 3:
+                logger.warning(f"Worker {worker_id} erro: {result}")
+
+    conn.close()
+    logger.info(f"Worker {worker_id}: {success:,} OK, {failed:,} erros")
+
+
+def compute_ranges(num_workers):
+    """Divide o keyspace por percentis reais do banco (distribuição balanceada)."""
+    conn = psycopg2.connect(DATABASE_URL)
+    with conn.cursor() as cur:
+        # Gerar percentis: para 4 workers, precisamos de p25, p50, p75
+        fractions = [i / num_workers for i in range(1, num_workers)]
+        percentiles = ', '.join(str(f) for f in fractions)
+        cur.execute(f"""
+            SELECT percentile_disc(ARRAY[{percentiles}]) WITHIN GROUP (ORDER BY cnpj_basico)
+            FROM estabelecimentos
+            WHERE (situacao_cadastral IN ('02', '03', '04')
+               OR (situacao_cadastral = '08'
+                   AND data_situacao_cadastral >= CURRENT_DATE - INTERVAL '2 years'))
+        """)
+        boundaries = cur.fetchone()[0]  # lista de cnpj_basico nos percentis
+    conn.close()
+
+    ranges = []
+    starts = ['00000000'] + list(boundaries)
+    ends = list(boundaries) + ['A']  # 'A' > '99999999' em collation locale-aware
+    for s, e in zip(starts, ends):
+        ranges.append((s, e))
+
+    logger.info(f"Ranges: {ranges}")
+    return ranges
 
 
 def create_index(es, index_name=INDEX_NAME):
@@ -287,6 +327,8 @@ def create_index(es, index_name=INDEX_NAME):
             "number_of_shards": 3,
             "number_of_replicas": 0,
             "refresh_interval": "-1",
+            "index.translog.durability": "async",
+            "index.translog.flush_threshold_size": "1gb",
             "analysis": {
                 "analyzer": {
                     "brazilian": {
@@ -382,14 +424,13 @@ def create_index(es, index_name=INDEX_NAME):
     logger.info(f"Índice '{index_name}' criado")
 
 
-ALIAS_NAME = INDEX_NAME  # 'empresas_b2b' é o alias que a API consulta
+ALIAS_NAME = INDEX_NAME
 
 
 def prepare_enrich_tables(conn):
     """Popula tabelas materializadas de enriquecimento usadas nos JOINs do sync."""
     logger.info("Populando tabelas de enriquecimento...")
     with conn.cursor() as cur:
-        # pgfn_empresas_mat — cópia materializada da view pgfn_empresas
         cur.execute("TRUNCATE TABLE enrich.pgfn_empresas_mat")
         cur.execute("""
             INSERT INTO enrich.pgfn_empresas_mat
@@ -399,7 +440,6 @@ def prepare_enrich_tables(conn):
         conn.commit()
         logger.info(f"  pgfn_empresas_mat: {pgfn_count:,} rows")
 
-        # cvm_lookup — consolidação de companhias abertas com indicadores mais recentes
         cur.execute("TRUNCATE TABLE enrich.cvm_lookup")
         cur.execute("""
             INSERT INTO enrich.cvm_lookup (cnpj_basico, setor_atividade, receita_liquida, lucro_liquido)
@@ -437,6 +477,7 @@ def vacuum_analyze(database_url):
 def main():
     logger.info("=" * 60)
     logger.info("Sync PostgreSQL → Elasticsearch")
+    logger.info(f"Workers: {NUM_WORKERS}, Batch PG: {BATCH_SIZE}, Chunk ES: {ES_CHUNK}, Threads/worker: {BULK_THREADS}")
     logger.info("=" * 60)
 
     es = Elasticsearch(ES_HOST, basic_auth=(ES_USER, ES_PASS), verify_certs=False)
@@ -453,51 +494,75 @@ def main():
     # 2. VACUUM ANALYZE para estatísticas atualizadas
     vacuum_analyze(DATABASE_URL)
 
-    # 3. Criar índice temporário com timestamp (alias swap = zero downtime)
+    # 3. Contar total para progresso
+    count_conn = psycopg2.connect(DATABASE_URL)
+    with count_conn.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) FROM estabelecimentos e
+            WHERE (e.situacao_cadastral IN ('02', '03', '04')
+               OR (e.situacao_cadastral = '08'
+                   AND e.data_situacao_cadastral >= CURRENT_DATE - INTERVAL '2 years'))
+        """)
+        total = cur.fetchone()[0]
+    count_conn.close()
+    logger.info(f"Total a indexar: {total:,} estabelecimentos")
+
+    # 4. Criar índice temporário
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     new_index = f"{ALIAS_NAME}_{timestamp}"
     create_index(es, new_index)
     logger.info(f"Índice temporário: {new_index}")
 
-    # 4. Indexar documentos
-    conn = psycopg2.connect(DATABASE_URL)
-    conn.set_session(readonly=True)
-    logger.info("PostgreSQL conectado")
-
-    logger.info("Indexando...")
+    # 5. Dividir keyspace e spawnar workers
+    ranges = compute_ranges(NUM_WORKERS)
+    counter = Value('i', 0)
     start = datetime.now()
-    success, failed = 0, 0
 
-    for ok, result in streaming_bulk(
-        es, generate_docs(conn, new_index),
-        chunk_size=ES_CHUNK,
-        raise_on_error=False,
-        raise_on_exception=False
-    ):
-        if ok:
-            success += 1
-        else:
-            failed += 1
-            if failed <= 5:
-                logger.warning(f"Erro: {result}")
+    workers = []
+    for i, (range_start, range_end) in enumerate(ranges):
+        p = Process(target=worker_process, args=(i, range_start, range_end, new_index, counter))
+        p.start()
+        workers.append(p)
+    logger.info(f"{NUM_WORKERS} workers iniciados")
+
+    # 6. Monitorar progresso
+    while any(p.is_alive() for p in workers):
+        time.sleep(30)
+        current = counter.value
+        pct = 100 * current / total if total else 0
+        elapsed_s = (datetime.now() - start).total_seconds()
+        speed = current / elapsed_s if elapsed_s > 0 else 0
+        eta_min = (total - current) / speed / 60 if speed > 0 else 0
+        logger.info(f"Progresso: {current:,} / {total:,} ({pct:.1f}%) — {speed:.0f} docs/s — ETA {eta_min:.0f} min")
+
+    for p in workers:
+        p.join()
 
     elapsed = datetime.now() - start
-    conn.close()
+    logger.info(f"Workers concluídos em {elapsed}")
 
-    # 5. Finalizar índice
+    # 7. Verificar se algum worker falhou
+    for p in workers:
+        if p.exitcode != 0:
+            logger.error(f"Worker PID {p.pid} saiu com código {p.exitcode}")
+
+    # 8. Finalizar índice (refresh + settings de produção)
     es.indices.refresh(index=new_index)
-    es.indices.put_settings(index=new_index, body={"refresh_interval": "30s"})
+    es.indices.put_settings(index=new_index, body={
+        "refresh_interval": "30s",
+        "index.translog.durability": "request",
+    })
 
     stats = es.indices.stats(index=new_index)['indices'][new_index]['primaries']
     doc_count = stats['docs']['count']
 
-    # 6. Validar antes do swap (proteção contra índice vazio)
+    # 9. Validar antes do swap
     if doc_count < 1000:
         logger.error(f"Apenas {doc_count} docs indexados — abortando swap (mínimo 1000)")
         es.indices.delete(index=new_index)
         sys.exit(1)
 
-    # 7. Alias swap atômico
+    # 10. Alias swap atômico
     old_indices = []
     if es.indices.exists_alias(name=ALIAS_NAME):
         alias_info = es.indices.get_alias(name=ALIAS_NAME)
@@ -507,7 +572,6 @@ def main():
     for old_idx in old_indices:
         actions.append({"remove": {"index": old_idx, "alias": ALIAS_NAME}})
 
-    # Se o alias não existe e um índice com o mesmo nome existe (migração do formato antigo)
     if not es.indices.exists_alias(name=ALIAS_NAME) and es.indices.exists(index=ALIAS_NAME):
         logger.info(f"Migrando de índice direto para alias: deletando índice '{ALIAS_NAME}'")
         old_indices = [ALIAS_NAME]
@@ -517,7 +581,7 @@ def main():
     es.indices.update_aliases(body={"actions": actions})
     logger.info(f"Alias '{ALIAS_NAME}' → '{new_index}'")
 
-    # 8. Limpar índices antigos
+    # 11. Limpar índices antigos
     for old_idx in old_indices:
         if old_idx != new_index:
             try:
@@ -531,9 +595,7 @@ def main():
     logger.info(f"Docs: {doc_count:,}")
     logger.info(f"Size: {stats['store']['size_in_bytes']/1024/1024/1024:.2f} GB")
     logger.info(f"Time: {elapsed}")
-    logger.info(f"Speed: {success/elapsed.total_seconds():.0f} docs/s")
-    if failed:
-        logger.warning(f"Failed: {failed:,}")
+    logger.info(f"Speed: {doc_count/elapsed.total_seconds():.0f} docs/s")
     logger.info("=" * 60)
 
 
