@@ -87,7 +87,7 @@ SELECT
     e.bairro,
     e.cep,
     e.municipio,
-    m.descricao as municipio_nome,
+    COALESCE(ibge.nome, m.descricao) as municipio_nome,
     e.uf,
     CASE WHEN e.ddd_1 IS NOT NULL AND e.telefone_1 IS NOT NULL
          THEN e.ddd_1 || e.telefone_1 END as telefone_1,

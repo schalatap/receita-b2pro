@@ -19,6 +19,7 @@ from tqdm import tqdm
 from config import config
 from database import Database
 from downloader import Downloader
+from fix_cnae_descriptions import apply as fix_cnae_descriptions
 from processor import get_file_type, process_file
 
 # Configure logging
@@ -151,6 +152,10 @@ def main():
         if saved_indexes:
             print("Recreating indexes (this may take a while)...")
             db.create_all_indexes_after_bulk_load(saved_indexes)
+
+        # Fix CNAE descriptions from IBGE (RFB delivers empty descriptions)
+        print("Applying IBGE CNAE descriptions...")
+        fix_cnae_descriptions(config.database_url)
 
         print("Done!")
 
