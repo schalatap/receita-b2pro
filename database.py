@@ -18,11 +18,20 @@ class Database:
     """PostgreSQL database handler with temp table upsert."""
 
     def __init__(
-        self, database_url: str, pre_truncated: set | None = None, retry_attempts: int = 3, retry_delay: int = 5
+        self,
+        database_url: str,
+        pre_truncated: set | None = None,
+        retry_attempts: int = 3,
+        retry_delay: int = 5,
+        fast_load: bool = False,
     ):
         self.database_url = database_url
         self.retry_attempts = retry_attempts
         self.retry_delay = retry_delay
+        # fast_load=True (apenas recarga completa "replace") relaxa a durabilidade
+        # (synchronous_commit=off) — seguro porque um crash é recuperado re-truncando.
+        # Em "upsert" fica off=False para não arriscar perda silenciosa no resume.
+        self.fast_load = fast_load
         self._pk_cache: dict = {}
         self._index_cache: dict = {}
         self._truncated_tables: set = set(pre_truncated) if pre_truncated else set()
@@ -49,12 +58,14 @@ class Database:
             try:
                 self.conn = psycopg2.connect(**params)
                 self.conn.autocommit = False
-                # Tuning de carga em massa — aplicado em TODA conexão (inclui os
-                # workers paralelos, que abrem conexão própria). Commit imediato
-                # para o SG não reverter o SET num rollback de transação.
+                # Tuning de carga — aplicado em TODA conexão (inclui workers paralelos).
+                # maintenance_work_mem acelera criação de índice e é inofensivo sempre.
+                # synchronous_commit=off só na recarga completa (fast_load), p/ não
+                # arriscar perda silenciosa de durabilidade no modo upsert/incremental.
                 with self.conn.cursor() as cur:
                     cur.execute("SET maintenance_work_mem = '512MB'")
-                    cur.execute("SET synchronous_commit = off")
+                    if self.fast_load:
+                        cur.execute("SET synchronous_commit = off")
                 self.conn.commit()
                 return
             except psycopg2.OperationalError:
@@ -111,9 +122,65 @@ class Database:
         self._index_cache[table_name] = indexes
         return indexes
 
+    _PENDING_TBL = "_index_recreate_pending"
+
+    def _persist_pending_indexes(self, saved_indexes: dict):
+        """Grava as defs de índice numa tabela de metadados ANTES de dropar.
+
+        Sobrevive a crash do processo E a recreate de container Docker → as defs
+        nunca ficam só em memória, garantindo recuperação no próximo run.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f"CREATE TABLE IF NOT EXISTS {self._PENDING_TBL} "
+                "(indexname text PRIMARY KEY, indexdef text NOT NULL)"
+            )
+            cur.execute(f"TRUNCATE {self._PENDING_TBL}")
+            for indexes in saved_indexes.values():
+                for idx in indexes:
+                    cur.execute(
+                        f"INSERT INTO {self._PENDING_TBL} (indexname, indexdef) VALUES (%s, %s)",
+                        (idx["indexname"], idx["indexdef"]),
+                    )
+        self.conn.commit()
+
+    def _clear_pending_indexes(self):
+        with self.conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS {self._PENDING_TBL}")
+        self.conn.commit()
+
+    def recover_pending_indexes(self) -> int:
+        """Recupera índices de um run anterior interrompido entre drop e recreate.
+
+        Idempotente e seguro de chamar sempre no início. Retorna nº recriado.
+        """
+        self.connect()
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT to_regclass(%s)", (self._PENDING_TBL,))
+            if cur.fetchone()[0] is None:
+                return 0
+            cur.execute(f"SELECT indexname, indexdef FROM {self._PENDING_TBL}")
+            pending = cur.fetchall()
+        if not pending:
+            self._clear_pending_indexes()
+            return 0
+        logger.warning(f"Recuperando {len(pending)} índices de um run interrompido...")
+        for indexname, indexdef in pending:
+            with self.conn.cursor() as cur:
+                try:
+                    cur.execute(indexdef)
+                    self.conn.commit()
+                    logger.info(f"  Recriado {indexname}")
+                except psycopg2.Error as e:
+                    self.conn.rollback()
+                    logger.warning(f"  Falhou {indexname}: {e}")
+        self._clear_pending_indexes()
+        return len(pending)
+
     def drop_all_indexes_for_bulk_load(self) -> dict:
         """Dropa índices não-PK das tabelas grandes p/ acelerar a carga.
 
+        Persiste as defs em tabela de metadados ANTES de dropar (crash-safe).
         Retorna {table_name: [definições]} para recriação posterior.
         """
         large_tables = ["empresas", "estabelecimentos", "socios", "dados_simples"]
@@ -123,11 +190,17 @@ class Database:
             indexes = self.get_table_indexes(table)
             if indexes:
                 saved_indexes[table] = indexes
-                with self.conn.cursor() as cur:
-                    for idx in indexes:
-                        cur.execute(f"DROP INDEX IF EXISTS {idx['indexname']}")
-                self.conn.commit()
-                logger.info(f"Dropped {len(indexes)} indexes from {table}")
+        if not saved_indexes:
+            return {}
+        # 1) Persistir defs ANTES de dropar (recuperável mesmo se o processo morrer).
+        self._persist_pending_indexes(saved_indexes)
+        # 2) Dropar.
+        for table, indexes in saved_indexes.items():
+            with self.conn.cursor() as cur:
+                for idx in indexes:
+                    cur.execute(f"DROP INDEX IF EXISTS {idx['indexname']}")
+            self.conn.commit()
+            logger.info(f"Dropped {len(indexes)} indexes from {table}")
         self._index_cache.clear()
         return saved_indexes
 
@@ -150,6 +223,7 @@ class Database:
                         self.conn.rollback()
                         logger.warning(f"  Failed {idx['indexname']}: {e}")
         logger.info("All indexes created!")
+        self._clear_pending_indexes()
 
     def ensure_schema(self):
         """Apply initial.sql if the schema tables don't exist yet.

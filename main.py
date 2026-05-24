@@ -102,7 +102,11 @@ def _pg_worker(zip_filename, directory, downloader, cfg, pre_truncated=None):
     from database import Database
 
     db = Database(
-        cfg.database_url, pre_truncated=pre_truncated, retry_attempts=cfg.retry_attempts, retry_delay=cfg.retry_delay
+        cfg.database_url,
+        pre_truncated=pre_truncated,
+        retry_attempts=cfg.retry_attempts,
+        retry_delay=cfg.retry_delay,
+        fast_load=(cfg.loading_strategy == "replace"),
     )
     try:
         for csv_path in downloader.download_file(directory, zip_filename):
@@ -173,8 +177,15 @@ def main():
     else:
         from database import Database
 
-        db = Database(config.database_url, retry_attempts=config.retry_attempts, retry_delay=config.retry_delay)
+        db = Database(
+            config.database_url,
+            retry_attempts=config.retry_attempts,
+            retry_delay=config.retry_delay,
+            fast_load=(config.loading_strategy == "replace"),
+        )
         db.ensure_schema()
+        # Recupera índices se um run anterior caiu entre drop e recreate (crash-safe).
+        db.recover_pending_indexes()
 
     saved_indexes: dict = {}
     try:
