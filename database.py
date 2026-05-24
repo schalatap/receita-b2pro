@@ -24,6 +24,7 @@ class Database:
         self.retry_attempts = retry_attempts
         self.retry_delay = retry_delay
         self._pk_cache: dict = {}
+        self._index_cache: dict = {}
         self._truncated_tables: set = set(pre_truncated) if pre_truncated else set()
         self.conn = None
 
@@ -48,6 +49,13 @@ class Database:
             try:
                 self.conn = psycopg2.connect(**params)
                 self.conn.autocommit = False
+                # Tuning de carga em massa — aplicado em TODA conexão (inclui os
+                # workers paralelos, que abrem conexão própria). Commit imediato
+                # para o SG não reverter o SET num rollback de transação.
+                with self.conn.cursor() as cur:
+                    cur.execute("SET maintenance_work_mem = '512MB'")
+                    cur.execute("SET synchronous_commit = off")
+                self.conn.commit()
                 return
             except psycopg2.OperationalError:
                 if attempt == self.retry_attempts - 1:
@@ -59,6 +67,89 @@ class Database:
         if self.conn:
             self.conn.close()
             self.conn = None
+
+    # ------------------------------------------------------------------
+    # Otimizações de carga em massa (portadas do fork receita-b2pro).
+    # O tuning de sessão (synchronous_commit/maintenance_work_mem) já é
+    # aplicado em connect(); estes métodos são chamados no main para
+    # clareza/explícito e para o drop/recreate de índices das tabelas grandes.
+    # ------------------------------------------------------------------
+    def set_bulk_load_config(self):
+        """Reaplica tuning de sessão para carga (idempotente; connect() já aplica)."""
+        self.connect()
+        with self.conn.cursor() as cur:
+            cur.execute("SET maintenance_work_mem = '512MB'")
+            cur.execute("SET synchronous_commit = off")
+        self.conn.commit()
+        logger.info("PostgreSQL bulk load configuration applied")
+
+    def reset_bulk_load_config(self):
+        """Restaura configuração de sessão ao padrão."""
+        self.connect()
+        with self.conn.cursor() as cur:
+            cur.execute("RESET maintenance_work_mem")
+            cur.execute("RESET synchronous_commit")
+        self.conn.commit()
+        logger.info("PostgreSQL configuration reset to defaults")
+
+    def get_table_indexes(self, table_name: str) -> List[dict]:
+        """Lista índices não-PK de uma tabela (com cache)."""
+        if table_name in self._index_cache:
+            return self._index_cache[table_name]
+        self.connect()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT indexname, indexdef
+                FROM pg_indexes
+                WHERE tablename = %s
+                AND indexname NOT LIKE '%%_pkey'
+                """,
+                (table_name,),
+            )
+            indexes = [{"indexname": row[0], "indexdef": row[1]} for row in cur.fetchall()]
+        self._index_cache[table_name] = indexes
+        return indexes
+
+    def drop_all_indexes_for_bulk_load(self) -> dict:
+        """Dropa índices não-PK das tabelas grandes p/ acelerar a carga.
+
+        Retorna {table_name: [definições]} para recriação posterior.
+        """
+        large_tables = ["empresas", "estabelecimentos", "socios", "dados_simples"]
+        saved_indexes = {}
+        self.connect()
+        for table in large_tables:
+            indexes = self.get_table_indexes(table)
+            if indexes:
+                saved_indexes[table] = indexes
+                with self.conn.cursor() as cur:
+                    for idx in indexes:
+                        cur.execute(f"DROP INDEX IF EXISTS {idx['indexname']}")
+                self.conn.commit()
+                logger.info(f"Dropped {len(indexes)} indexes from {table}")
+        self._index_cache.clear()
+        return saved_indexes
+
+    def create_all_indexes_after_bulk_load(self, saved_indexes: dict):
+        """Recria os índices após a carga."""
+        if not saved_indexes:
+            return
+        self.connect()
+        total = sum(len(idxs) for idxs in saved_indexes.values())
+        logger.info(f"Creating {total} indexes...")
+        for table, indexes in saved_indexes.items():
+            logger.info(f"Creating {len(indexes)} indexes on {table}...")
+            with self.conn.cursor() as cur:
+                for idx in indexes:
+                    try:
+                        cur.execute(idx["indexdef"])
+                        self.conn.commit()
+                        logger.info(f"  Created {idx['indexname']}")
+                    except psycopg2.Error as e:
+                        self.conn.rollback()
+                        logger.warning(f"  Failed {idx['indexname']}: {e}")
+        logger.info("All indexes created!")
 
     def ensure_schema(self):
         """Apply initial.sql if the schema tables don't exist yet.

@@ -176,6 +176,7 @@ def main():
         db = Database(config.database_url, retry_attempts=config.retry_attempts, retry_delay=config.retry_delay)
         db.ensure_schema()
 
+    saved_indexes: dict = {}
     try:
         # Select directory
         if args.month:
@@ -294,6 +295,13 @@ def main():
 
         else:
             # Database mode: process files by dependency group
+            # Otimização de carga em massa (só na recarga completa = replace):
+            # tuning de sessão + dropar índices não-PK das tabelas grandes.
+            if config.loading_strategy == "replace":
+                db.set_bulk_load_config()
+                logger.info("Dropping indexes for bulk load...")
+                saved_indexes = db.drop_all_indexes_for_bulk_load()
+
             file_groups = group_files_by_dependency(pending_files)
             workers = config.process_workers
 
@@ -354,6 +362,16 @@ def main():
                                 logger.error(f"Error: {csv_path.name}: {e}")
                                 raise
 
+            # Recriar índices após toda a carga + corrigir descrições de CNAE/IBGE
+            # (a RFB entrega descrições vazias/corrompidas).
+            if saved_indexes:
+                logger.info("Recreating indexes (pode demorar)...")
+                db.create_all_indexes_after_bulk_load(saved_indexes)
+            from fix_cnae_descriptions import apply as fix_cnae_descriptions
+
+            logger.info("Applying IBGE CNAE descriptions...")
+            fix_cnae_descriptions(config.database_url)
+
         if is_parquet:
             parquet.close()
             manifest = parquet.write_manifest(source_month=directory)
@@ -365,10 +383,21 @@ def main():
 
     except Exception as e:
         logger.error(f"Failed: {e}")
+        # Tenta recriar índices mesmo em erro, p/ não deixar tabela sem índice.
+        if db and saved_indexes:
+            logger.info("Recreating indexes after error...")
+            try:
+                db.create_all_indexes_after_bulk_load(saved_indexes)
+            except Exception as idx_err:
+                logger.error(f"Failed to recreate indexes: {idx_err}")
         sys.exit(1)
 
     finally:
         if db:
+            try:
+                db.reset_bulk_load_config()
+            except Exception:
+                pass
             db.disconnect()
         downloader.cleanup()
 
