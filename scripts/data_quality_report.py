@@ -21,8 +21,13 @@ counts (e.g. before a release or as a CI gate).
 Currently measured:
 - CNPJ check-digit validity (DV computed from the standard RFB
   modulus-11 weighted-sum algorithm vs the stored cnpj_dv).
-- Orphan FK counts against the reference tables (cnae, municipio,
-  motivo, pais, natureza_juridica).
+- Orphan FK counts against the reference tables, covering estabelecimentos
+  (cnae, municipio, motivo, pais), empresas (natureza_juridica,
+  qualificacao_responsavel) and socios (pais, qualificacao_do_socio,
+  qualificacao_do_representante_legal excluding the '00' placeholder).
+- Enriched-domain coverage: orphans against the raw monthly lookup vs the
+  enriched lookup (reference_domains_enriched), so the gap closed by official
+  supplemental rows is visible. Skipped when the enriched tables are absent.
 - EX (Exterior) UF count in estabelecimentos.
 - Sentinel-like value counts: capital_social = 999999999999,
   representante_legal = '***000000**'.
@@ -45,21 +50,29 @@ from typing import Optional
 import psycopg2
 
 # CNPJ check-digit algorithm (Brazilian RFB modulus-11 weighted sum).
-# Given 12 leading digits, compute DV1 with weights _W1, then DV2 with
-# weights _W2 over the 13 digits (12 + DV1). Rule: if (11 - sum%11) >= 10,
+# Given the 12-character stem, compute DV1 with weights _W1, then DV2 with
+# weights _W2 over the 13 values (12 + DV1). Rule: if (11 - sum%11) >= 10,
 # the digit is 0; otherwise (11 - sum%11).
+#
+# AIDEV-NOTE: cnpj-alphanumeric: from 2026-07 the stem (basico+ordem) may
+# contain A-Z as well as 0-9 (Receita Federal / Serpro). The published rule
+# values each character as ord(c) - 48, so '0'..'9' -> 0..9 and 'A'..'Z' ->
+# 17..42; the weights, modulus, and the two check digits stay numeric and
+# unchanged. Existing all-digit CNPJs are a strict subset and still validate.
 _W1 = (5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2)
 _W2 = (6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2)
+_CNPJ_STEM_CHARS = frozenset("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 
 def cnpj_expected_dv(first_12: str) -> str:
-    """Compute the 2-character check-digit string for a 12-digit CNPJ stem.
+    """Compute the 2-character check-digit string for a 12-character CNPJ stem.
 
-    Raises ValueError if input isn't exactly 12 digits.
+    The stem is the 8-char basico + 4-char ordem, each char in 0-9 or A-Z.
+    Raises ValueError if input isn't exactly 12 such characters.
     """
-    if len(first_12) != 12 or not first_12.isdigit():
-        raise ValueError(f"expected 12 digits, got {first_12!r}")
-    d = [int(c) for c in first_12]
+    if len(first_12) != 12 or any(c not in _CNPJ_STEM_CHARS for c in first_12):
+        raise ValueError(f"expected 12 alphanumeric (0-9, A-Z) chars, got {first_12!r}")
+    d = [ord(c) - 48 for c in first_12]
     s1 = sum(d[i] * _W1[i] for i in range(12))
     dv1 = 11 - (s1 % 11)
     if dv1 >= 10:
@@ -162,7 +175,56 @@ _ORPHAN_FK_CHECKS = [
         "ref_table": "naturezas_juridicas",
         "ref_column": "codigo",
     },
+    {
+        "label": "empresas.qualificacao_responsavel ∉ qualificacoes_socios",
+        "table": "empresas",
+        "column": "qualificacao_responsavel",
+        "ref_table": "qualificacoes_socios",
+        "ref_column": "codigo",
+    },
+    {
+        "label": "socios.pais ∉ paises",
+        "table": "socios",
+        "column": "pais",
+        "ref_table": "paises",
+        "ref_column": "codigo",
+    },
+    {
+        "label": "socios.qualificacao_do_socio ∉ qualificacoes_socios",
+        "table": "socios",
+        "column": "qualificacao_do_socio",
+        "ref_table": "qualificacoes_socios",
+        "ref_column": "codigo",
+    },
+    {
+        # '00' is the placeholder qualification that pairs with the placeholder
+        # representante_legal, not an orphan - exclude it like the recipe does.
+        "label": "socios.qualificacao_do_representante_legal ∉ qualificacoes_socios (≠ '00')",
+        "table": "socios",
+        "column": "qualificacao_do_representante_legal",
+        "ref_table": "qualificacoes_socios",
+        "ref_column": "codigo",
+        "extra_predicate": "t.qualificacao_do_representante_legal <> '00'",
+    },
 ]
+
+
+def _count_orphans(cur, table: str, column: str, ref_table: str, ref_column: str, extra_predicate: str = "") -> int:
+    """Count rows whose FK value is non-NULL but absent from ref_table."""
+    extra = f"AND {extra_predicate}" if extra_predicate else ""
+    cur.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM {table} t
+        WHERE t.{column} IS NOT NULL
+          {extra}
+          AND NOT EXISTS (
+              SELECT 1 FROM {ref_table} r
+              WHERE r.{ref_column} = t.{column}
+          )
+        """
+    )
+    return cur.fetchone()[0]
 
 
 def measure_orphan_fks(conn) -> list[dict]:
@@ -172,19 +234,94 @@ def measure_orphan_fks(conn) -> list[dict]:
     results = []
     with conn.cursor() as cur:
         for check in _ORPHAN_FK_CHECKS:
-            query = f"""
-                SELECT COUNT(*)
-                FROM {check["table"]} t
-                WHERE t.{check["column"]} IS NOT NULL
-                  AND NOT EXISTS (
-                      SELECT 1 FROM {check["ref_table"]} r
-                      WHERE r.{check["ref_column"]} = t.{check["column"]}
-                  )
-            """
-            cur.execute(query)
-            count = cur.fetchone()[0]
+            count = _count_orphans(
+                cur,
+                check["table"],
+                check["column"],
+                check["ref_table"],
+                check["ref_column"],
+                check.get("extra_predicate", ""),
+            )
             results.append({"label": check["label"], "orphans": count})
     return results
+
+
+# Domains that the reference_domains_enriched recipe supplements. For each, the
+# report shows how many orphans remain against the raw MONTHLY lookup vs the
+# ENRICHED lookup, so the gap closed by official supplemental rows is visible.
+# Skipped gracefully when the enriched tables are not present (recipe not run).
+_ENRICHED_FK_CHECKS = [
+    {
+        "label": "estabelecimentos.motivo_situacao_cadastral",
+        "table": "estabelecimentos",
+        "column": "motivo_situacao_cadastral",
+        "monthly_ref": "motivos",
+        "enriched_ref": "motivos_enriched",
+    },
+    {
+        "label": "estabelecimentos.pais",
+        "table": "estabelecimentos",
+        "column": "pais",
+        "monthly_ref": "paises",
+        "enriched_ref": "paises_enriched",
+    },
+    {
+        "label": "empresas.qualificacao_responsavel",
+        "table": "empresas",
+        "column": "qualificacao_responsavel",
+        "monthly_ref": "qualificacoes_socios",
+        "enriched_ref": "qualificacoes_socios_enriched",
+    },
+    {
+        "label": "socios.pais",
+        "table": "socios",
+        "column": "pais",
+        "monthly_ref": "paises",
+        "enriched_ref": "paises_enriched",
+    },
+    {
+        "label": "socios.qualificacao_do_socio",
+        "table": "socios",
+        "column": "qualificacao_do_socio",
+        "monthly_ref": "qualificacoes_socios",
+        "enriched_ref": "qualificacoes_socios_enriched",
+    },
+    {
+        "label": "socios.qualificacao_do_representante_legal (≠ '00')",
+        "table": "socios",
+        "column": "qualificacao_do_representante_legal",
+        "monthly_ref": "qualificacoes_socios",
+        "enriched_ref": "qualificacoes_socios_enriched",
+        "extra_predicate": "t.qualificacao_do_representante_legal <> '00'",
+    },
+]
+
+
+def measure_enriched_orphans(conn) -> dict:
+    """Compare orphan counts against the monthly lookup vs the enriched lookup.
+
+    Returns {'available': bool, 'rows': [{label, monthly_orphans, enriched_orphans}]}.
+    available is False (and rows empty) when the enriched tables do not exist,
+    i.e. reference_domains_enriched was not applied.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('public.motivos_enriched')")
+        if cur.fetchone()[0] is None:
+            return {"available": False, "rows": []}
+
+        rows = []
+        for check in _ENRICHED_FK_CHECKS:
+            extra = check.get("extra_predicate", "")
+            monthly = _count_orphans(cur, check["table"], check["column"], check["monthly_ref"], "codigo", extra)
+            enriched = _count_orphans(cur, check["table"], check["column"], check["enriched_ref"], "codigo", extra)
+            rows.append(
+                {
+                    "label": check["label"],
+                    "monthly_orphans": monthly,
+                    "enriched_orphans": enriched,
+                }
+            )
+    return {"available": True, "rows": rows}
 
 
 def measure_exterior_uf(conn) -> dict:
@@ -305,6 +442,30 @@ def format_report(measurements: dict, scope: dict) -> str:
         lines.append(f"| {row['label']} | {row['orphans']:,} |")
     lines.append("")
 
+    # --- Enriched-domain coverage ---
+    enriched = measurements["enriched_orphans"]
+    lines.append("## Enriched-domain coverage")
+    lines.append("")
+    if not enriched["available"]:
+        lines.append(
+            "Enriched lookup tables not found - apply "
+            "`recipes/postgres/reference_domains_enriched.sql` to measure how many "
+            "orphans the official supplemental rows resolve."
+        )
+        lines.append("")
+    else:
+        lines.append(
+            "Orphans against the raw monthly lookup vs the enriched lookup. The "
+            "difference is what official supplemental rows resolve; the enriched "
+            "column is what stays genuinely unresolved."
+        )
+        lines.append("")
+        lines.append("| Relationship | Monthly orphans | After enrichment |")
+        lines.append("|---|---:|---:|")
+        for row in enriched["rows"]:
+            lines.append(f"| {row['label']} | {row['monthly_orphans']:,} | {row['enriched_orphans']:,} |")
+        lines.append("")
+
     # --- Exterior UF ---
     ex = measurements["exterior_uf"]
     lines.append("## Exterior (uf='EX') estabelecimentos")
@@ -394,6 +555,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("Measuring orphan FK references...", file=sys.stderr)
         orphan_fk_results = measure_orphan_fks(conn)
 
+        print("Measuring enriched-domain coverage...", file=sys.stderr)
+        enriched_orphan_results = measure_enriched_orphans(conn)
+
         print("Measuring Exterior UF count...", file=sys.stderr)
         exterior_uf_results = measure_exterior_uf(conn)
 
@@ -410,6 +574,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         {
             "cnpj_check_digits": cnpj_results,
             "orphan_fks": orphan_fk_results,
+            "enriched_orphans": enriched_orphan_results,
             "exterior_uf": exterior_uf_results,
             "capital_sentinel": capital_results,
             "representante_sentinel": representante_results,

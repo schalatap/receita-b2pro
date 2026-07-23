@@ -273,18 +273,147 @@ class TestTransform:
         assert result["cep"][6] is None
 
 
+class TestSocioId:
+    """socio_id is a deterministic UUID over the canonical identity tuple.
+
+    The masked CPF in cnpj_cpf_do_socio is not unique inside a company
+    (issue #78), so the table PK is socio_id, not the old triple.
+    """
+
+    @staticmethod
+    def _make_df(rows):
+        return pl.DataFrame(
+            {
+                "cnpj_basico": [r[0] for r in rows],
+                "identificador_de_socio": [r[1] for r in rows],
+                "nome_socio": [r[2] for r in rows],
+                "cnpj_cpf_do_socio": [r[3] for r in rows],
+                "qualificacao_do_socio": ["22"] * len(rows),
+                "data_entrada_sociedade": [r[4] for r in rows],
+                "pais": [None] * len(rows),
+                "representante_legal": [None] * len(rows),
+                "nome_do_representante": [None] * len(rows),
+                "qualificacao_do_representante_legal": [None] * len(rows),
+                "faixa_etaria": ["0"] * len(rows),
+            }
+        )
+
+    def test_old_triple_collision_yields_distinct_socio_ids(self):
+        """Two partners sharing the masked-CPF triple but with different names
+        must produce different socio_id. This is the 2026-05 case from #78."""
+        df = self._make_df(
+            [
+                ("01654767", "2", "ALICE SILVA", "***909016**", "20200101"),
+                ("01654767", "2", "BOB SOUZA", "***909016**", "20200101"),
+            ]
+        )
+
+        result = _transform(df, "SOCIOCSV")
+
+        assert result["socio_id"][0] != result["socio_id"][1]
+
+    def test_name_casing_and_whitespace_canonicalize(self):
+        """RFB cosmetic name jitter (case, double spaces) must not churn the key."""
+        df = self._make_df(
+            [
+                ("12345678", "2", "ALICE  SILVA", "***123456**", "20200101"),
+                ("12345678", "2", "alice silva", "***123456**", "20200101"),
+            ]
+        )
+
+        result = _transform(df, "SOCIOCSV")
+
+        assert result["socio_id"][0] == result["socio_id"][1]
+
+    def test_qualificacao_change_keeps_socio_id_stable(self):
+        """qualificacao_do_socio is an updateable attribute, not identity.
+        A partner whose qualification changes between months must upsert,
+        not create a ghost row."""
+        df = self._make_df(
+            [
+                ("12345678", "2", "ALICE SILVA", "***123456**", "20200101"),
+                ("12345678", "2", "ALICE SILVA", "***123456**", "20200101"),
+            ]
+        )
+        df = df.with_columns(pl.Series("qualificacao_do_socio", ["22", "49"]))
+
+        result = _transform(df, "SOCIOCSV")
+
+        assert result["socio_id"][0] == result["socio_id"][1]
+
+    def test_null_name_is_distinct_from_other_partners(self):
+        """A row with NULL nome_socio must get a valid socio_id and not
+        collide with a sibling partner under the same masked CPF."""
+        df = self._make_df(
+            [
+                ("12345678", "2", None, "***123456**", "20200101"),
+                ("12345678", "2", "ALICE SILVA", "***123456**", "20200101"),
+            ]
+        )
+
+        result = _transform(df, "SOCIOCSV")
+
+        assert result["socio_id"][0] is not None
+        assert result["socio_id"][0] != result["socio_id"][1]
+
+    def test_raw_nome_socio_unchanged(self):
+        """Canonicalization runs only against the hash input; the raw column
+        must not be mutated."""
+        df = self._make_df([("12345678", "2", "  ALICE   SILVA  ", "***123456**", "20200101")])
+
+        result = _transform(df, "SOCIOCSV")
+
+        assert result["nome_socio"][0] == "  ALICE   SILVA  "
+
+    def test_socio_id_is_uuid_string(self):
+        df = self._make_df([("12345678", "2", "ALICE SILVA", "***123456**", "20200101")])
+
+        result = _transform(df, "SOCIOCSV")
+
+        import uuid
+
+        uuid.UUID(result["socio_id"][0])  # raises if not a valid UUID string
+
+
 class TestValidate:
     """Test _validate function for format validation."""
 
-    def test_validate_cnpj_basico_format(self):
-        """Test that cnpj_basico must be exactly 8 digits."""
-        df = pl.DataFrame({"cnpj_basico": ["12345678", "1234", "ABCDEFGH", None]})
+    def test_validate_cnpj_basico_format(self, caplog):
+        """cnpj_basico is 8 uppercase alphanumeric chars (0-9, A-Z) from the
+        2026-07 alphanumeric CNPJ. Validation logs malformed values but keeps
+        raw data (no nullify)."""
+        df = pl.DataFrame({"cnpj_basico": ["12345678", "12ABC678", "ABCDEFGH", "1234", "abcd1234", None]})
 
-        result = _validate(df, "EMPRECSV")
+        with caplog.at_level("WARNING"):
+            result = _validate(df, "EMPRECSV")
 
-        # Validation logs but doesn't nullify format errors (keeps raw values)
+        # Numeric and uppercase-alphanumeric stems are valid and kept as-is.
         assert result["cnpj_basico"][0] == "12345678"
-        assert result["cnpj_basico"][1] == "1234"
+        assert result["cnpj_basico"][1] == "12ABC678"
+        assert result["cnpj_basico"][2] == "ABCDEFGH"
+        # Too-short "1234" and lowercase "abcd1234" are flagged but still kept.
+        assert "cnpj_basico: 2 invalid" in caplog.text
+        assert result["cnpj_basico"][3] == "1234"
+
+    def test_validate_cnpj_ordem_alphanumeric(self, caplog):
+        """cnpj_ordem is 4 uppercase alphanumeric chars; lowercase/short warn."""
+        df = pl.DataFrame({"cnpj_ordem": ["0001", "01DE", "abcd", "12", None]})
+
+        with caplog.at_level("WARNING"):
+            result = _validate(df, "ESTABELE")
+
+        assert result["cnpj_ordem"][1] == "01DE"
+        assert "cnpj_ordem: 2 invalid" in caplog.text
+
+    def test_validate_cnpj_dv_stays_numeric(self, caplog):
+        """cnpj_dv remains 2 numeric digits even under alphanumeric CNPJ;
+        an alphabetic dv is flagged."""
+        df = pl.DataFrame({"cnpj_dv": ["91", "3X", None]})
+
+        with caplog.at_level("WARNING"):
+            _validate(df, "ESTABELE")
+
+        assert "cnpj_dv: 1 invalid" in caplog.text
 
     def test_validate_situacao_cadastral(self):
         """Test that situacao_cadastral must be 01, 02, 03, 04, or 08."""

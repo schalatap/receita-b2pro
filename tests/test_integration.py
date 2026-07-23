@@ -36,11 +36,25 @@ EXPECTED_COUNTS = {
     "naturezas_juridicas": 91,
     "paises": 255,
     "qualificacoes_socios": 68,
-    "empresas": 2000,
-    "estabelecimentos": 2000,
+    "empresas": 2006,
+    "estabelecimentos": 2006,
     "socios": 2000,
     "dados_simples": 2000,
 }
+
+# Crafted fixture rows (cnpj_basico 99000001-99000004) exercise the enriched
+# reference-domain recipe: motivo 32 (supplemental), pais 150/994 (supplemental),
+# pais 008 (unresolved orphan), qualificacao_responsavel 36 (legacy supplemental).
+# Row 99000005 exercises the static domain-label recipe's NULL path: it carries
+# an unknown porte (07) and unknown situacao_cadastral (07), neither of which is
+# in the label tables, so empresa_detalhe's LEFT JOINs must keep the row with a
+# NULL descricao. The ingest validator only warns on out-of-domain porte/situacao
+# codes; it does not drop or nullify them, so the codes survive ingest.
+# Row 99000006 carries situacao_cadastral 05 (Ativa Não Regular), a code in the
+# SERPRO domain but outside the open-data layout regex (^(01|02|03|04|08)$). The
+# validator only warns, so it survives ingest and must resolve end to end through
+# empresa_detalhe's LEFT JOIN, not silently become NULL.
+ENRICHED_SUPPLEMENTAL_MOTIVO_32 = "Inexistente De Fato – Ade/Cosar"
 
 
 def _pg_available() -> bool:
@@ -204,6 +218,321 @@ class TestFullPipeline:
         )
 
 
+class TestRecipeReferenceDomainsEnriched:
+    """Apply recipes/postgres/reference_domains_enriched.sql against the
+    fixture-loaded database and verify the enriched lookups add only verified
+    supplemental rows, preserve monthly rows, and carry provenance.
+
+    Runs before TestRecipeEmpresaDetalhe so the enriched tables exist when the
+    denormalization recipe LEFT JOINs them (pytest preserves file order).
+    """
+
+    RECIPE_PATH = Path(__file__).parent.parent / "recipes" / "postgres" / "reference_domains_enriched.sql"
+
+    ENRICHED_TABLES = ("motivos_enriched", "paises_enriched", "qualificacoes_socios_enriched")
+    EXPECTED_COLUMNS = {
+        "codigo",
+        "descricao",
+        "source_kind",
+        "source_url",
+        "is_supplemental",
+        "confidence",
+        "notes",
+    }
+
+    def test_recipe_executes(self, test_db):
+        """The recipe SQL should parse and execute, creating all three tables."""
+        sql = self.RECIPE_PATH.read_text()
+        with test_db.conn.cursor() as cur:
+            cur.execute(sql)
+        test_db.conn.commit()
+
+        for table in self.ENRICHED_TABLES:
+            with test_db.conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.tables WHERE table_name = %s",
+                    (table,),
+                )
+                assert cur.fetchone() is not None, f"{table} not created"
+
+    def test_provenance_schema(self, test_db):
+        """Every enriched table exposes the same provenance columns."""
+        for table in self.ENRICHED_TABLES:
+            with test_db.conn.cursor() as cur:
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+                    (table,),
+                )
+                cols = {row[0] for row in cur.fetchall()}
+            assert cols == self.EXPECTED_COLUMNS, f"{table} columns: {cols}"
+
+    def test_monthly_rows_preserved_and_win(self, test_db):
+        """Each enriched table is a superset of its monthly lookup: every
+        monthly (codigo, descricao) pair is present as a non-supplemental row,
+        and supplemental rows never override a monthly codigo."""
+        for monthly, enriched in (
+            ("motivos", "motivos_enriched"),
+            ("paises", "paises_enriched"),
+            ("qualificacoes_socios", "qualificacoes_socios_enriched"),
+        ):
+            with test_db.conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT COUNT(*) FROM {monthly} mo
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM {enriched} en
+                        WHERE en.codigo = mo.codigo
+                          AND en.descricao IS NOT DISTINCT FROM mo.descricao
+                          AND en.is_supplemental = false
+                          AND en.source_kind = 'receita_monthly'
+                    )
+                    """
+                )
+                missing = cur.fetchone()[0]
+                assert missing == 0, f"{enriched} dropped/altered {missing} monthly rows"
+
+                # No codigo appears more than once (anti-join + PK guarantee).
+                cur.execute(f"SELECT codigo, COUNT(*) FROM {enriched} GROUP BY codigo HAVING COUNT(*) > 1")
+                assert cur.fetchall() == [], f"{enriched} has duplicate codigo"
+
+                # Supplemental rows must not collide with a monthly codigo.
+                cur.execute(
+                    f"""
+                    SELECT COUNT(*) FROM {enriched} en
+                    WHERE en.is_supplemental
+                      AND EXISTS (SELECT 1 FROM {monthly} mo WHERE mo.codigo = en.codigo)
+                    """
+                )
+                assert cur.fetchone()[0] == 0, f"{enriched} supplemental row overrides a monthly codigo"
+
+    def test_motivo_32_supplemental(self, test_db):
+        """motivo 32 is absent from the monthly Motivos delivery but resolves via
+        the SERPRO supplemental row, verbatim and flagged supplemental."""
+        with test_db.conn.cursor() as cur:
+            cur.execute(
+                "SELECT descricao, source_kind, is_supplemental, source_url, confidence "
+                "FROM motivos_enriched WHERE codigo = '32'"
+            )
+            row = cur.fetchone()
+        assert row is not None, "motivo 32 missing from motivos_enriched"
+        descricao, source_kind, is_supplemental, source_url, confidence = row
+        assert descricao == ENRICHED_SUPPLEMENTAL_MOTIVO_32, repr(descricao)
+        assert source_kind == "serpro_dominio"
+        assert is_supplemental is True
+        assert source_url and source_url.startswith("https://bcadastros.serpro.gov.br/")
+        assert confidence == "high"
+
+    def test_pais_supplemental_codes(self, test_db):
+        """The SERPRO-confirmed orphan country codes resolve via supplemental
+        rows with their official labels; codes absent from every official table
+        stay unresolved (no row)."""
+        expected = {
+            # 015/042 exercise the zero-padding match: SERPRO stores them as
+            # "15"/"42", the pipeline pads pais to "015"/"042".
+            "015": "ALAND, ILHAS",
+            "042": "ANTÁRTICA",
+            "150": "JERSEY, ILHA DO CANAL",
+            "151": "CANÁRIAS, ILHAS",
+            "200": "CURACAO",
+            "321": "GUERNSEY",
+            "359": "MAN, ILHA DE",
+            "367": "INGLATERRA",
+            "393": "JERSEY",
+            "449": "MACEDÔNIA, ANT.REP.IUGOSLAVA",
+            "498": "MONTENEGRO",
+            "578": "PALESTINA",
+            "678": "SAINT KITTS E NEVIS",
+            "693": "SAO BARTOLOMEU",
+            "699": "SÃO MARTINHO, ILHA DE (PARTE HOLANDESA)",
+            "737": "SERVIA",
+            "755": "SVALBARD E JAN MAYEN",
+            "994": "A DESIGNAR",
+        }
+        with test_db.conn.cursor() as cur:
+            for codigo, descricao in expected.items():
+                cur.execute(
+                    "SELECT descricao, is_supplemental, source_kind FROM paises_enriched WHERE codigo = %s",
+                    (codigo,),
+                )
+                row = cur.fetchone()
+                assert row is not None, f"pais {codigo} missing from paises_enriched"
+                assert row[0] == descricao, f"pais {codigo}: {row[0]!r}"
+                assert row[1] is True and row[2] == "serpro_dominio"
+
+            # Absent from both supplemental sources -> intentionally unresolved.
+            for codigo in ("008", "009", "452"):
+                cur.execute("SELECT 1 FROM paises_enriched WHERE codigo = %s", (codigo,))
+                assert cur.fetchone() is None, f"pais {codigo} should stay unresolved"
+
+    def test_qualificacao_36_legacy_supplement(self, test_db):
+        """Code 36 (Gerente-Delegado) is a legacy qualification - documented in
+        Receita's open-data table but no longer collected, so it is absent from
+        the monthly delivery and resolved via a receita_ods supplemental row. It
+        is the only supplemental qualification (nothing else is invented)."""
+        with test_db.conn.cursor() as cur:
+            cur.execute(
+                "SELECT descricao, is_supplemental, source_kind, confidence "
+                "FROM qualificacoes_socios_enriched WHERE codigo = '36'"
+            )
+            row = cur.fetchone()
+            assert row is not None, "qualificacao 36 missing from qualificacoes_socios_enriched"
+            assert row[0] == "Gerente-Delegado", repr(row[0])
+            assert row[1] is True and row[2] == "receita_ods" and row[3] == "high"
+
+            cur.execute("SELECT codigo FROM qualificacoes_socios_enriched WHERE is_supplemental ORDER BY codigo")
+            assert [r[0] for r in cur.fetchall()] == ["36"], "only code 36 may be supplemented"
+
+    def test_idempotent(self, test_db):
+        """Re-running the recipe drops+recreates without error, same counts."""
+        sql = self.RECIPE_PATH.read_text()
+        counts_before = {t: _count_rows(test_db, t) for t in self.ENRICHED_TABLES}
+        with test_db.conn.cursor() as cur:
+            cur.execute(sql)
+        test_db.conn.commit()
+        for table, before in counts_before.items():
+            assert _count_rows(test_db, table) == before, f"{table} row count changed on re-run"
+
+
+class TestRecipeDomainLabels:
+    """Apply recipes/postgres/reference_domain_labels.sql against the
+    fixture-loaded database and verify the static domain-label tables resolve
+    the Receita enum fields the monthly package ships with no lookup CSV. Two
+    grains: empresa/estabelecimento (empresas.porte,
+    estabelecimentos.situacao_cadastral, estabelecimentos.identificador_matriz_filial,
+    consumed by empresa_detalhe) and sócio (socios.identificador_de_socio,
+    socios.faixa_etaria, consumed by socios_detalhe).
+
+    Runs before TestRecipeEmpresaDetalhe / TestRecipeSociosDetalhe so the static
+    tables already exist when the denormalization recipes LEFT JOIN them (pytest
+    preserves file order).
+    """
+
+    RECIPE_PATH = Path(__file__).parent.parent / "recipes" / "postgres" / "reference_domain_labels.sql"
+
+    LABEL_TABLES = (
+        "portes_empresa",
+        "situacoes_cadastrais",
+        "indicadores_matriz_filial",
+        "identificadores_socio",
+        "faixas_etarias",
+    )
+
+    def test_recipe_executes(self, test_db):
+        """The recipe SQL should parse and execute, creating all three tables."""
+        sql = self.RECIPE_PATH.read_text()
+        with test_db.conn.cursor() as cur:
+            cur.execute(sql)
+        test_db.conn.commit()
+
+        for table in self.LABEL_TABLES:
+            with test_db.conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.tables WHERE table_name = %s",
+                    (table,),
+                )
+                assert cur.fetchone() is not None, f"{table} not created"
+
+    def test_porte_labels_resolve_verbatim(self, test_db):
+        """porte codes resolve to their verbatim SERPRO labels."""
+        expected = {
+            "01": "Microempresa",
+            "03": "Empresa de Pequeno Porte",
+            "05": "Demais",
+        }
+        with test_db.conn.cursor() as cur:
+            for codigo, descricao in expected.items():
+                cur.execute("SELECT descricao FROM portes_empresa WHERE codigo = %s", (codigo,))
+                row = cur.fetchone()
+                assert row is not None, f"porte {codigo} missing from portes_empresa"
+                assert row[0] == descricao, f"porte {codigo}: {row[0]!r}"
+
+    def test_situacao_labels_resolve_verbatim(self, test_db):
+        """situacao_cadastral codes resolve to their verbatim SERPRO labels."""
+        expected = {
+            "02": "Ativa",
+            "05": "Ativa Não Regular",
+            "08": "Baixada",
+        }
+        with test_db.conn.cursor() as cur:
+            for codigo, descricao in expected.items():
+                cur.execute("SELECT descricao FROM situacoes_cadastrais WHERE codigo = %s", (codigo,))
+                row = cur.fetchone()
+                assert row is not None, f"situacao {codigo} missing from situacoes_cadastrais"
+                assert row[0] == descricao, f"situacao {codigo}: {row[0]!r}"
+
+    def test_matriz_filial_labels_resolve_verbatim(self, test_db):
+        """The matriz/filial indicator resolves both integer codes verbatim."""
+        expected = {1: "Matriz", 2: "Filial"}
+        with test_db.conn.cursor() as cur:
+            for codigo, descricao in expected.items():
+                cur.execute("SELECT descricao FROM indicadores_matriz_filial WHERE codigo = %s", (codigo,))
+                row = cur.fetchone()
+                assert row is not None, f"matriz/filial {codigo} missing"
+                assert row[0] == descricao, f"matriz/filial {codigo}: {row[0]!r}"
+
+    def test_identificador_socio_labels_resolve(self, test_db):
+        """identificador_de_socio codes resolve to their layout-derived labels
+        (readable title case, not byte-verbatim - the layout gives these in prose)."""
+        expected = {
+            "1": "Pessoa Jurídica",
+            "2": "Pessoa Física",
+            "3": "Estrangeiro",
+        }
+        with test_db.conn.cursor() as cur:
+            for codigo, descricao in expected.items():
+                cur.execute("SELECT descricao FROM identificadores_socio WHERE codigo = %s", (codigo,))
+                row = cur.fetchone()
+                assert row is not None, f"identificador {codigo} missing from identificadores_socio"
+                assert row[0] == descricao, f"identificador {codigo}: {row[0]!r}"
+
+    def test_faixa_etaria_labels_resolve(self, test_db):
+        """faixa_etaria codes resolve to their layout-derived labels (readable
+        title case, not byte-verbatim - the layout gives the age bands in prose),
+        including the documented '0' (Não se aplica), which is a real value here -
+        nulling it is socios_clean's job, not this lookup's."""
+        expected = {
+            "0": "Não se aplica",
+            "1": "0 a 12 anos",
+            "6": "51 a 60 anos",
+            "9": "Maiores de 80 anos",
+        }
+        with test_db.conn.cursor() as cur:
+            for codigo, descricao in expected.items():
+                cur.execute("SELECT descricao FROM faixas_etarias WHERE codigo = %s", (codigo,))
+                row = cur.fetchone()
+                assert row is not None, f"faixa {codigo} missing from faixas_etarias"
+                assert row[0] == descricao, f"faixa {codigo}: {row[0]!r}"
+
+    def test_socio_label_provenance_is_receita_layout(self, test_db):
+        """The sócio enums have no SERPRO domain CSV, so every row is sourced
+        from the Receita CNPJ layout PDF."""
+        for table in ("identificadores_socio", "faixas_etarias"):
+            with test_db.conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT count(*) FROM {table} "
+                    "WHERE source_kind <> 'receita_layout' "
+                    "OR source_url <> 'https://www.gov.br/receitafederal/dados/cnpj-metadados.pdf'"
+                )
+                assert cur.fetchone()[0] == 0, f"{table} has non-receita_layout provenance"
+
+    def test_codigo_is_unique_primary_key(self, test_db):
+        """codigo is the PK of every label table, so no code may appear twice."""
+        for table in self.LABEL_TABLES:
+            with test_db.conn.cursor() as cur:
+                cur.execute(f"SELECT codigo, COUNT(*) FROM {table} GROUP BY codigo HAVING COUNT(*) > 1")
+                assert cur.fetchall() == [], f"{table} has duplicate codigo"
+
+    def test_idempotent(self, test_db):
+        """Re-running the recipe drops+recreates without error, same counts."""
+        sql = self.RECIPE_PATH.read_text()
+        counts_before = {t: _count_rows(test_db, t) for t in self.LABEL_TABLES}
+        with test_db.conn.cursor() as cur:
+            cur.execute(sql)
+        test_db.conn.commit()
+        for table, before in counts_before.items():
+            assert _count_rows(test_db, table) == before, f"{table} row count changed on re-run"
+
+
 class TestRecipeEmpresaDetalhe:
     """Apply recipes/postgres/empresa_detalhe.sql against the fixture-loaded
     database and verify the derived table has the expected shape.
@@ -216,11 +545,19 @@ class TestRecipeEmpresaDetalhe:
     """
 
     RECIPE_PATH = Path(__file__).parent.parent / "recipes" / "postgres" / "empresa_detalhe.sql"
+    ENRICHED_RECIPE_PATH = Path(__file__).parent.parent / "recipes" / "postgres" / "reference_domains_enriched.sql"
+    LABELS_RECIPE_PATH = Path(__file__).parent.parent / "recipes" / "postgres" / "reference_domain_labels.sql"
 
     def test_recipe_executes(self, test_db):
-        """The recipe SQL should parse and execute without errors."""
+        """The recipe SQL should parse and execute without errors. It depends on
+        the enriched lookups and the static domain-label tables, so apply those
+        first."""
+        enriched_sql = self.ENRICHED_RECIPE_PATH.read_text()
+        labels_sql = self.LABELS_RECIPE_PATH.read_text()
         sql = self.RECIPE_PATH.read_text()
         with test_db.conn.cursor() as cur:
+            cur.execute(enriched_sql)
+            cur.execute(labels_sql)
             cur.execute(sql)
         test_db.conn.commit()
 
@@ -279,6 +616,53 @@ class TestRecipeEmpresaDetalhe:
             count = cur.fetchone()[0]
             assert count > 0, "No rows have all reference descriptions joined"
 
+    def test_enriched_motivo_description_resolves(self, test_db):
+        """The crafted motivo-32 estabelecimento (cnpj_basico 99000001) gets its
+        description from the enriched supplemental row, not NULL."""
+        with test_db.conn.cursor() as cur:
+            cur.execute(
+                "SELECT motivo_situacao_cadastral, motivo_situacao_cadastral_descricao "
+                "FROM empresa_detalhe WHERE cnpj_basico = '99000001'"
+            )
+            row = cur.fetchone()
+        assert row is not None, "crafted motivo-32 estabelecimento missing"
+        assert row[0] == "32"
+        assert row[1] == ENRICHED_SUPPLEMENTAL_MOTIVO_32, repr(row[1])
+
+    def test_enriched_pais_resolved_and_unresolved(self, test_db):
+        """pais 150/994 resolve via enriched supplements; the spurious 008 code
+        stays NULL so the gap stays visible."""
+        with test_db.conn.cursor() as cur:
+            cur.execute("SELECT pais, pais_descricao FROM empresa_detalhe WHERE cnpj_basico = '99000002'")
+            assert cur.fetchone() == ("150", "JERSEY, ILHA DO CANAL")
+            cur.execute("SELECT pais, pais_descricao FROM empresa_detalhe WHERE cnpj_basico = '99000004'")
+            assert cur.fetchone() == ("994", "A DESIGNAR")
+            cur.execute("SELECT pais, pais_descricao FROM empresa_detalhe WHERE cnpj_basico = '99000003'")
+            pais, descricao = cur.fetchone()
+            assert pais == "008" and descricao is None, "unresolved pais 008 must stay NULL"
+
+    def test_qualificacao_responsavel_descricao(self, test_db):
+        """The new qualificacao_responsavel_descricao column resolves codes via
+        the enriched lookup, including the legacy code 36 (Gerente-Delegado)."""
+        with test_db.conn.cursor() as cur:
+            cur.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'empresa_detalhe'
+                  AND column_name = 'qualificacao_responsavel_descricao'
+            """)
+            assert cur.fetchone() is not None, "qualificacao_responsavel_descricao column missing"
+
+            # code 36 is a legacy code, resolved via the receita_ods supplement.
+            cur.execute(
+                "SELECT qualificacao_responsavel, qualificacao_responsavel_descricao "
+                "FROM empresa_detalhe WHERE cnpj_basico = '99000004'"
+            )
+            assert cur.fetchone() == ("36", "Gerente-Delegado"), "legacy code 36 should resolve"
+
+            # at least some rows resolve to a non-null description.
+            cur.execute("SELECT COUNT(*) FROM empresa_detalhe WHERE qualificacao_responsavel_descricao IS NOT NULL")
+            assert cur.fetchone()[0] > 0, "no qualificacao_responsavel descriptions resolved"
+
     def test_dados_simples_columns_present(self, test_db):
         """dados_simples LEFT JOIN should expose raw columns. Some rows may
         have NULL Simples (no record), but the columns must exist."""
@@ -303,9 +687,12 @@ class TestRecipeEmpresaDetalhe:
             }, f"Missing dados_simples columns: {cols}"
 
     def test_no_derived_columns_leaked(self, test_db):
-        """The recipe should NOT add opinionated columns like is_ativa,
-        is_matriz, or label-substituted enums (situacao_cadastral stays
-        as the source code, not 'Ativa'). Sanity check against scope creep."""
+        """The recipe should NOT add opinionated columns like is_ativa or
+        is_matriz, and must not SUBSTITUTE source codes with labels: the raw
+        code columns (situacao_cadastral, porte) stay as codes. Adding a
+        parallel *_descricao column alongside the code is expected and is
+        verified by test_domain_label_descriptions_resolve, not forbidden
+        here. Sanity check against scope creep."""
         with test_db.conn.cursor() as cur:
             cur.execute("""
                 SELECT column_name FROM information_schema.columns
@@ -317,13 +704,133 @@ class TestRecipeEmpresaDetalhe:
                 "is_matriz",
                 "is_optante_simples",
                 "is_mei",
-                "situacao_cadastral_descricao",
-                "porte_descricao",
                 "cnpj_formatado",
                 "endereco_completo",
             }
             leaked = cols & forbidden
             assert not leaked, f"Recipe leaked opinionated columns: {leaked}"
+            # The raw code columns must survive (not be replaced by labels).
+            assert {"situacao_cadastral", "porte", "identificador_matriz_filial"} <= cols, (
+                "raw enum code columns must be preserved alongside their descriptions"
+            )
+
+    def test_domain_label_descriptions_resolve(self, test_db):
+        """The three static domain-label LEFT JOINs (portes_empresa,
+        situacoes_cadastrais, indicadores_matriz_filial) populate the new
+        *_descricao columns. Known codes resolve to their verbatim label;
+        every accepted code is covered so no known code yields NULL; an
+        unknown code keeps the row with a NULL descricao (LEFT, not INNER)."""
+        with test_db.conn.cursor() as cur:
+            # Columns exist.
+            cur.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'empresa_detalhe'
+                  AND column_name IN (
+                    'porte_descricao',
+                    'situacao_cadastral_descricao',
+                    'identificador_matriz_filial_descricao'
+                  )
+            """)
+            cols = {row[0] for row in cur.fetchall()}
+            assert cols == {
+                "porte_descricao",
+                "situacao_cadastral_descricao",
+                "identificador_matriz_filial_descricao",
+            }, f"Missing domain-label descricao columns: {cols}"
+
+            # Known codes resolve to their verbatim labels. The crafted
+            # estabelecimento 99000001 is guaranteed in the join and carries
+            # porte 01, situacao 02, matriz 1.
+            cur.execute("""
+                SELECT porte, porte_descricao,
+                       situacao_cadastral, situacao_cadastral_descricao,
+                       identificador_matriz_filial,
+                       identificador_matriz_filial_descricao
+                FROM empresa_detalhe WHERE cnpj_basico = '99000001'
+            """)
+            assert cur.fetchone() == ("01", "Microempresa", "02", "Ativa", 1, "Matriz")
+
+            # situacao_cadastral 05 (Ativa Não Regular) is in the SERPRO domain
+            # but outside the open-data layout regex; the ingest validator only
+            # warns, so it survives and must resolve end to end. Crafted
+            # estabelecimento 99000006 carries it; a regression that drops 05
+            # from situacoes_cadastrais (or makes the join INNER) is caught here.
+            cur.execute("""
+                SELECT situacao_cadastral, situacao_cadastral_descricao
+                FROM empresa_detalhe WHERE cnpj_basico = '99000006'
+            """)
+            assert cur.fetchone() == ("05", "Ativa Não Regular"), (
+                "situacao_cadastral 05 must resolve to 'Ativa Não Regular' end to end"
+            )
+
+            # porte '00' (NÃO INFORMADO) is absent from the SERPRO porte CSV but
+            # accepted by the ingest validator, so the label table must carry it.
+            # Its label is verbatim from the Receita layout PDF, which writes it
+            # uppercase ("00 – NÃO INFORMADO").
+            cur.execute("SELECT descricao FROM portes_empresa WHERE codigo = '00'")
+            assert cur.fetchone() == ("NÃO INFORMADO",), "porte '00' must resolve to verbatim 'NÃO INFORMADO'"
+
+            # Coverage: every code that IS in a label table must resolve, so no
+            # row whose code is in the label set may have a NULL descricao. The
+            # check is symmetric across all three columns: a code outside the
+            # label set is allowed to be NULL (that is the unknown path, asserted
+            # below), but a code inside it must never be NULL. The ingest
+            # validator only WARNS on out-of-domain porte/situacao codes - it
+            # neither drops nor nullifies them - so porte/situacao can carry
+            # unknown codes too (the crafted row 99000005 does), exactly like
+            # matriz/filial.
+            cur.execute("""
+                SELECT COUNT(*) FROM empresa_detalhe
+                WHERE (porte IN (SELECT codigo FROM portes_empresa)
+                       AND porte_descricao IS NULL)
+                   OR (situacao_cadastral IN (SELECT codigo FROM situacoes_cadastrais)
+                       AND situacao_cadastral_descricao IS NULL)
+                   OR (identificador_matriz_filial IN (
+                           SELECT codigo FROM indicadores_matriz_filial)
+                       AND identificador_matriz_filial_descricao IS NULL)
+            """)
+            assert cur.fetchone()[0] == 0, (
+                "every label-covered porte/situacao_cadastral/matriz_filial code must resolve to a description"
+            )
+
+            # Code 2 -> Filial. The crafted estabelecimento 99000001 exercises
+            # the matriz/filial LEFT JOIN for code 1 (-> Matriz) end to end, and
+            # 99000003 exercises the unknown path (3 -> NULL), but no code-2
+            # estabelecimento survives empresa_detalhe's INNER JOIN (the fixture
+            # samples estabelecimentos and empresas independently, and the code-2
+            # rows have no parent empresa). Assert code 2 against the label table
+            # directly so a removed or relabeled (2, 'Filial') row is caught, the
+            # same way porte '00' is checked above.
+            cur.execute("SELECT descricao FROM indicadores_matriz_filial WHERE codigo = 2")
+            assert cur.fetchone() == ("Filial",), "matriz/filial code 2 must resolve to 'Filial'"
+
+            # Unknown code keeps the row with a NULL descricao. The crafted
+            # orphan estabelecimento 99000003 carries identificador_matriz_filial
+            # = 3, which is not in indicadores_matriz_filial (1/2 only), so the
+            # LEFT JOIN must preserve the row and leave the description NULL.
+            cur.execute("""
+                SELECT identificador_matriz_filial,
+                       identificador_matriz_filial_descricao
+                FROM empresa_detalhe WHERE cnpj_basico = '99000003'
+            """)
+            row = cur.fetchone()
+            assert row is not None, "orphan estabelecimento 99000003 must be kept"
+            assert row == (3, None), "unknown matriz/filial code must stay NULL, row preserved"
+
+            # Unknown porte AND situacao keep the row with NULL descricoes. The
+            # crafted row 99000005 carries porte 07 and situacao_cadastral 07,
+            # neither of which is in portes_empresa/situacoes_cadastrais, so the
+            # static-label LEFT JOINs must preserve the row and leave both
+            # descriptions NULL. This proves the joins are LEFT (not INNER) for
+            # porte/situacao too, not only for matriz/filial.
+            cur.execute("""
+                SELECT porte, porte_descricao,
+                       situacao_cadastral, situacao_cadastral_descricao
+                FROM empresa_detalhe WHERE cnpj_basico = '99000005'
+            """)
+            row = cur.fetchone()
+            assert row is not None, "row with unknown porte/situacao must be kept"
+            assert row == ("07", None, "07", None), "unknown porte/situacao codes must stay NULL, row preserved"
 
     def test_idempotent(self, test_db):
         """Re-running the recipe should drop+recreate without error and
@@ -345,11 +852,15 @@ class TestRecipeDataQualityFlags:
     """
 
     RECIPE_PATH = Path(__file__).parent.parent / "recipes" / "postgres" / "data_quality_flags.sql"
+    ENRICHED_RECIPE_PATH = Path(__file__).parent.parent / "recipes" / "postgres" / "reference_domains_enriched.sql"
 
     def test_recipe_executes(self, test_db):
-        """The recipe SQL should parse and execute without errors."""
+        """The recipe SQL should parse and execute without errors. The enriched
+        flags depend on the enriched lookups, so apply those first."""
+        enriched_sql = self.ENRICHED_RECIPE_PATH.read_text()
         sql = self.RECIPE_PATH.read_text()
         with test_db.conn.cursor() as cur:
+            cur.execute(enriched_sql)
             cur.execute(sql)
         test_db.conn.commit()
 
@@ -394,6 +905,8 @@ class TestRecipeDataQualityFlags:
             "is_exterior",
             "pais_lookup_missing",
             "motivo_lookup_missing",
+            "pais_enriched_lookup_missing",
+            "motivo_enriched_lookup_missing",
             "capital_social_is_suspicious_sentinel",
         }
 
@@ -456,8 +969,54 @@ class TestRecipeDataQualityFlags:
             """)
             motivo_mismatches = cur.fetchone()[0]
 
+            cur.execute("""
+                SELECT COUNT(*)
+                FROM data_quality_flags dq
+                JOIN estabelecimentos e USING (cnpj_basico, cnpj_ordem, cnpj_dv)
+                WHERE dq.pais_enriched_lookup_missing IS DISTINCT FROM (
+                    e.pais IS NOT NULL
+                    AND NOT EXISTS (SELECT 1 FROM paises_enriched p WHERE p.codigo = e.pais)
+                )
+                   OR dq.motivo_enriched_lookup_missing IS DISTINCT FROM (
+                    e.motivo_situacao_cadastral IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM motivos_enriched m
+                        WHERE m.codigo = e.motivo_situacao_cadastral
+                    )
+                )
+            """)
+            enriched_mismatches = cur.fetchone()[0]
+
         assert pais_mismatches == 0, f"pais_lookup_missing mismatches for {pais_mismatches} rows"
         assert motivo_mismatches == 0, f"motivo_lookup_missing mismatches for {motivo_mismatches} rows"
+        assert enriched_mismatches == 0, f"enriched lookup-missing flags mismatch for {enriched_mismatches} rows"
+
+    def test_monthly_and_enriched_flags_diverge_on_supplemental(self, test_db):
+        """The whole point: a supplemental code (motivo 32, pais 150/994) is
+        monthly-missing but enriched-resolved; a spurious code (pais 008) is
+        missing under both."""
+        with test_db.conn.cursor() as cur:
+            # crafted motivo-32 estabelecimento: monthly-missing, enriched-resolved
+            cur.execute(
+                "SELECT motivo_lookup_missing, motivo_enriched_lookup_missing "
+                "FROM data_quality_flags WHERE cnpj_basico = '99000001'"
+            )
+            assert cur.fetchone() == (True, False), "motivo 32 should be monthly-missing, enriched-resolved"
+
+            # pais 150 and 994: monthly-missing, enriched-resolved
+            cur.execute(
+                "SELECT pais_lookup_missing, pais_enriched_lookup_missing "
+                "FROM data_quality_flags WHERE cnpj_basico IN ('99000002', '99000004') "
+                "ORDER BY cnpj_basico"
+            )
+            assert cur.fetchall() == [(True, False), (True, False)]
+
+            # pais 008: missing under both (spurious, intentionally unresolved)
+            cur.execute(
+                "SELECT pais_lookup_missing, pais_enriched_lookup_missing "
+                "FROM data_quality_flags WHERE cnpj_basico = '99000003'"
+            )
+            assert cur.fetchone() == (True, True), "spurious pais 008 must stay missing under both"
 
     def test_company_level_flag_matches_empresas_predicate(self, test_db):
         """capital_social flag should be derived from empresas, not guessed
@@ -745,11 +1304,15 @@ class TestRecipeSociosQualityFlags:
     """
 
     RECIPE_PATH = Path(__file__).parent.parent / "recipes" / "postgres" / "socios_quality_flags.sql"
+    ENRICHED_RECIPE_PATH = Path(__file__).parent.parent / "recipes" / "postgres" / "reference_domains_enriched.sql"
 
     def test_recipe_executes(self, test_db):
-        """The recipe SQL should parse and execute without errors."""
+        """The recipe SQL should parse and execute without errors. The enriched
+        flags depend on the enriched lookups, so apply those first."""
+        enriched_sql = self.ENRICHED_RECIPE_PATH.read_text()
         sql = self.RECIPE_PATH.read_text()
         with test_db.conn.cursor() as cur:
+            cur.execute(enriched_sql)
             cur.execute(sql)
         test_db.conn.commit()
 
@@ -774,6 +1337,7 @@ class TestRecipeSociosQualityFlags:
             cols = {row[0] for row in cur.fetchall()}
 
         assert cols == {
+            "socio_id",
             "cnpj_basico",
             "identificador_de_socio",
             "cnpj_cpf_do_socio",
@@ -781,6 +1345,9 @@ class TestRecipeSociosQualityFlags:
             "pais_lookup_missing",
             "qualificacao_socio_lookup_missing",
             "qualificacao_representante_lookup_missing",
+            "pais_enriched_lookup_missing",
+            "qualificacao_socio_enriched_lookup_missing",
+            "qualificacao_representante_enriched_lookup_missing",
             "faixa_etaria_nao_se_aplica",
         }
 
@@ -791,7 +1358,7 @@ class TestRecipeSociosQualityFlags:
             cur.execute("""
                 SELECT COUNT(*)
                 FROM socios_quality_flags f
-                JOIN socios s USING (cnpj_basico, identificador_de_socio, cnpj_cpf_do_socio)
+                JOIN socios s USING (socio_id)
                 WHERE f.representante_is_placeholder IS DISTINCT FROM (
                     s.representante_legal = '***000000**'
                     AND s.qualificacao_do_representante_legal = '00'
@@ -819,7 +1386,34 @@ class TestRecipeSociosQualityFlags:
             """)
             mismatches = cur.fetchone()[0]
 
+            cur.execute("""
+                SELECT COUNT(*)
+                FROM socios_quality_flags f
+                JOIN socios s USING (socio_id)
+                WHERE f.pais_enriched_lookup_missing IS DISTINCT FROM (
+                    s.pais IS NOT NULL
+                    AND NOT EXISTS (SELECT 1 FROM paises_enriched p WHERE p.codigo = s.pais)
+                )
+                   OR f.qualificacao_socio_enriched_lookup_missing IS DISTINCT FROM (
+                    s.qualificacao_do_socio IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM qualificacoes_socios_enriched q
+                        WHERE q.codigo = s.qualificacao_do_socio
+                    )
+                )
+                   OR f.qualificacao_representante_enriched_lookup_missing IS DISTINCT FROM (
+                    s.qualificacao_do_representante_legal IS NOT NULL
+                    AND s.qualificacao_do_representante_legal <> '00'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM qualificacoes_socios_enriched q
+                        WHERE q.codigo = s.qualificacao_do_representante_legal
+                    )
+                )
+            """)
+            enriched_mismatches = cur.fetchone()[0]
+
         assert mismatches == 0, f"socios_quality_flags predicate mismatches for {mismatches} rows"
+        assert enriched_mismatches == 0, f"socios enriched predicate mismatches for {enriched_mismatches} rows"
 
     def test_no_raw_or_clean_columns(self, test_db):
         """This is a flags table, not socios_clean or socios_detalhe."""
@@ -897,6 +1491,7 @@ class TestRecipeSociosClean:
             cols = {row[0] for row in cur.fetchall()}
 
         assert cols == {
+            "socio_id",
             "cnpj_basico",
             "identificador_de_socio",
             "cnpj_cpf_do_socio",
@@ -921,7 +1516,7 @@ class TestRecipeSociosClean:
             cur.execute("""
                 SELECT COUNT(*)
                 FROM socios_clean sc
-                JOIN socios_quality_flags f USING (cnpj_basico, identificador_de_socio, cnpj_cpf_do_socio)
+                JOIN socios_quality_flags f USING (socio_id)
                 WHERE sc.representante_is_placeholder IS DISTINCT FROM f.representante_is_placeholder
                    OR sc.pais_lookup_missing IS DISTINCT FROM f.pais_lookup_missing
                    OR sc.qualificacao_socio_lookup_missing IS DISTINCT FROM f.qualificacao_socio_lookup_missing
@@ -940,8 +1535,8 @@ class TestRecipeSociosClean:
             cur.execute("""
                 SELECT COUNT(*)
                 FROM socios_clean sc
-                JOIN socios s USING (cnpj_basico, identificador_de_socio, cnpj_cpf_do_socio)
-                JOIN socios_quality_flags f USING (cnpj_basico, identificador_de_socio, cnpj_cpf_do_socio)
+                JOIN socios s USING (socio_id)
+                JOIN socios_quality_flags f USING (socio_id)
                 WHERE sc.representante_legal_raw IS DISTINCT FROM s.representante_legal
                    OR sc.nome_do_representante_raw IS DISTINCT FROM s.nome_do_representante
                    OR sc.qualificacao_do_representante_legal_raw IS DISTINCT FROM
@@ -1001,6 +1596,156 @@ class TestRecipeSociosClean:
         test_db.conn.commit()
 
         count_after = _count_rows(test_db, "socios_clean")
+        assert count_before == count_after, f"Re-running recipe changed row count: {count_before} -> {count_after}"
+
+
+class TestRecipeSociosDetalhe:
+    """Apply recipes/postgres/socios_detalhe.sql against the fixture-loaded
+    database and verify the per-sócio denormalization preserves every source
+    code, adds descriptions beside them, and mutates no values.
+
+    Depends on test_db being populated by TestFullPipeline. The recipe LEFT
+    JOINs the enriched lookups and the static label tables, so this applies
+    reference_domains_enriched + reference_domain_labels first (both idempotent).
+    """
+
+    RECIPE_PATH = Path(__file__).parent.parent / "recipes" / "postgres" / "socios_detalhe.sql"
+    ENRICHED_RECIPE_PATH = Path(__file__).parent.parent / "recipes" / "postgres" / "reference_domains_enriched.sql"
+    LABELS_RECIPE_PATH = Path(__file__).parent.parent / "recipes" / "postgres" / "reference_domain_labels.sql"
+
+    def test_recipe_executes(self, test_db):
+        """The recipe SQL should parse and execute. It depends on the enriched
+        lookups and the static label tables, so apply those first."""
+        enriched_sql = self.ENRICHED_RECIPE_PATH.read_text()
+        labels_sql = self.LABELS_RECIPE_PATH.read_text()
+        sql = self.RECIPE_PATH.read_text()
+        with test_db.conn.cursor() as cur:
+            cur.execute(enriched_sql)
+            cur.execute(labels_sql)
+            cur.execute(sql)
+        test_db.conn.commit()
+
+        with test_db.conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'socios_detalhe'")
+            assert cur.fetchone() is not None, "socios_detalhe table not created"
+
+    def test_row_count_matches_socios(self, test_db):
+        """Every lookup is 1:1 on its codigo key, so the five LEFT JOINs neither
+        drop nor multiply rows: one socios_detalhe row per socios row."""
+        socios = _count_rows(test_db, "socios")
+        detalhe = _count_rows(test_db, "socios_detalhe")
+        assert detalhe > 0, "socios_detalhe is empty"
+        assert detalhe == socios, f"socios_detalhe ({detalhe}) != socios ({socios})"
+
+    def test_socio_id_is_unique(self, test_db):
+        """socio_id is the grain; it must be unique (the old triple is not)."""
+        with test_db.conn.cursor() as cur:
+            cur.execute("SELECT socio_id, COUNT(*) FROM socios_detalhe GROUP BY socio_id HAVING COUNT(*) > 1")
+            assert cur.fetchall() == [], "socios_detalhe has duplicate socio_id"
+
+    def test_identificador_descriptions_resolve(self, test_db):
+        """The sócio-type code resolves to its label for every fixture value."""
+        expected = {"1": "Pessoa Jurídica", "2": "Pessoa Física", "3": "Estrangeiro"}
+        with test_db.conn.cursor() as cur:
+            for codigo, descricao in expected.items():
+                cur.execute(
+                    "SELECT DISTINCT identificador_de_socio_descricao FROM socios_detalhe "
+                    "WHERE identificador_de_socio = %s",
+                    (codigo,),
+                )
+                rows = [r[0] for r in cur.fetchall()]
+                assert rows == [descricao], f"identificador {codigo} resolved to {rows!r}"
+
+    def test_faixa_etaria_descriptions_resolve(self, test_db):
+        """Age-band codes resolve to their labels, including '0' (Não se aplica),
+        which this recipe keeps as a real value (no nulling - that's socios_clean)."""
+        expected = {"0": "Não se aplica", "6": "51 a 60 anos", "9": "Maiores de 80 anos"}
+        with test_db.conn.cursor() as cur:
+            for codigo, descricao in expected.items():
+                cur.execute(
+                    "SELECT DISTINCT faixa_etaria_descricao FROM socios_detalhe WHERE faixa_etaria = %s",
+                    (codigo,),
+                )
+                rows = [r[0] for r in cur.fetchall()]
+                assert rows == [descricao], f"faixa {codigo} resolved to {rows!r}"
+
+    def test_descriptions_consistent_with_lookups(self, test_db):
+        """Every description column equals the LEFT JOIN of its raw code against
+        the source lookup - resolving where the code matches and NULL where it
+        does not. One invariant covers correct resolution and unknown -> NULL for
+        all five joins at once."""
+        with test_db.conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*) FROM socios_detalhe sd
+                WHERE sd.identificador_de_socio_descricao IS DISTINCT FROM
+                        (SELECT descricao FROM identificadores_socio l WHERE l.codigo = sd.identificador_de_socio)
+                   OR sd.qualificacao_do_socio_descricao IS DISTINCT FROM
+                        (SELECT descricao FROM qualificacoes_socios_enriched l
+                         WHERE l.codigo = sd.qualificacao_do_socio)
+                   OR sd.pais_descricao IS DISTINCT FROM
+                        (SELECT descricao FROM paises_enriched l WHERE l.codigo = sd.pais)
+                   OR sd.qualificacao_do_representante_legal_descricao IS DISTINCT FROM
+                        (SELECT descricao FROM qualificacoes_socios_enriched l
+                         WHERE l.codigo = sd.qualificacao_do_representante_legal)
+                   OR sd.faixa_etaria_descricao IS DISTINCT FROM
+                        (SELECT descricao FROM faixas_etarias l WHERE l.codigo = sd.faixa_etaria)
+            """)
+            assert cur.fetchone()[0] == 0, "a description column diverged from its source lookup"
+
+    def test_unknown_code_keeps_row_with_null_descricao(self, test_db):
+        """An unresolved code keeps the row (LEFT JOIN) with a NULL descricao.
+        The fixtures exercise this through sócios whose pais is empty/unmatched."""
+        with test_db.conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (
+                        WHERE NOT EXISTS (SELECT 1 FROM paises_enriched pe WHERE pe.codigo = sd.pais)
+                    ) AS unmatched,
+                    COUNT(*) FILTER (
+                        WHERE NOT EXISTS (SELECT 1 FROM paises_enriched pe WHERE pe.codigo = sd.pais)
+                          AND sd.pais_descricao IS NOT NULL
+                    ) AS unmatched_with_descricao
+                FROM socios_detalhe sd
+            """)
+            unmatched, unmatched_with_descricao = cur.fetchone()
+        assert unmatched > 0, "fixtures no longer exercise an unmatched pais code"
+        assert unmatched_with_descricao == 0, "an unmatched pais resolved to a non-NULL descricao"
+
+    def test_no_value_mutation_of_raw_columns(self, test_db):
+        """Raw source columns pass through verbatim. In particular the
+        representante placeholders (qualificacao '00', representante_legal
+        '***000000**') stay raw - nulling them is socios_clean's job, not this
+        recipe's."""
+        with test_db.conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*) FROM socios_detalhe sd JOIN socios s USING (socio_id)
+                WHERE sd.cnpj_basico IS DISTINCT FROM s.cnpj_basico
+                   OR sd.identificador_de_socio IS DISTINCT FROM s.identificador_de_socio
+                   OR sd.nome_socio IS DISTINCT FROM s.nome_socio
+                   OR sd.cnpj_cpf_do_socio IS DISTINCT FROM s.cnpj_cpf_do_socio
+                   OR sd.qualificacao_do_socio IS DISTINCT FROM s.qualificacao_do_socio
+                   OR sd.data_entrada_sociedade IS DISTINCT FROM s.data_entrada_sociedade
+                   OR sd.pais IS DISTINCT FROM s.pais
+                   OR sd.representante_legal IS DISTINCT FROM s.representante_legal
+                   OR sd.nome_do_representante IS DISTINCT FROM s.nome_do_representante
+                   OR sd.qualificacao_do_representante_legal IS DISTINCT FROM s.qualificacao_do_representante_legal
+                   OR sd.faixa_etaria IS DISTINCT FROM s.faixa_etaria
+            """)
+            assert cur.fetchone()[0] == 0, "a raw column was mutated"
+
+            # The placeholder qualificacao '00' is present and kept raw (a real
+            # description may or may not exist; the point is the code is not nulled).
+            cur.execute("SELECT COUNT(*) FROM socios_detalhe WHERE qualificacao_do_representante_legal = '00'")
+            assert cur.fetchone()[0] > 0, "fixtures no longer exercise the representante placeholder '00'"
+
+    def test_idempotent(self, test_db):
+        """Re-running the recipe drops+recreates without error, same row count."""
+        sql = self.RECIPE_PATH.read_text()
+        count_before = _count_rows(test_db, "socios_detalhe")
+        with test_db.conn.cursor() as cur:
+            cur.execute(sql)
+        test_db.conn.commit()
+        count_after = _count_rows(test_db, "socios_detalhe")
         assert count_before == count_after, f"Re-running recipe changed row count: {count_before} -> {count_after}"
 
 
@@ -1269,3 +2014,215 @@ class TestRecipeEmpresasBuscaNomeCounts:
 
         count_after = _count_rows(test_db, "empresas_busca_nome_counts")
         assert count_before == count_after, f"re-running recipe changed row count: {count_before} -> {count_after}"
+
+
+class TestDataQualityReportMeasurements:
+    """Exercise scripts/data_quality_report.py orphan + enriched-coverage
+    measurements against the fixture-loaded database. The crafted fixture rows
+    (motivo 32, pais 150/008/994, qualificacao_responsavel 36) make the
+    monthly-vs-enriched gap observable.
+    """
+
+    ENRICHED_RECIPE_PATH = Path(__file__).parent.parent / "recipes" / "postgres" / "reference_domains_enriched.sql"
+
+    @staticmethod
+    def _report_module():
+        import sys
+
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import data_quality_report
+
+        return data_quality_report
+
+    def _ensure_enriched(self, test_db):
+        with test_db.conn.cursor() as cur:
+            cur.execute(self.ENRICHED_RECIPE_PATH.read_text())
+        test_db.conn.commit()
+
+    def test_new_orphan_checks_present_and_detect_code_36(self, test_db):
+        """The orphan report now covers qualificacao_responsavel and the socios
+        relationships. Code 36 (unverified) is a real orphan and must surface."""
+        dqr = self._report_module()
+        results = {r["label"]: r["orphans"] for r in dqr.measure_orphan_fks(test_db.conn)}
+
+        for label in (
+            "empresas.qualificacao_responsavel ∉ qualificacoes_socios",
+            "socios.pais ∉ paises",
+            "socios.qualificacao_do_socio ∉ qualificacoes_socios",
+            "socios.qualificacao_do_representante_legal ∉ qualificacoes_socios (≠ '00')",
+        ):
+            assert label in results, f"missing orphan check: {label}"
+
+        # crafted empresa 99000004 carries qualificacao_responsavel '36'
+        assert results["empresas.qualificacao_responsavel ∉ qualificacoes_socios"] >= 1
+
+    def test_enriched_coverage_shows_gap_closed(self, test_db):
+        """Enriched coverage reports monthly vs enriched orphans. Supplemental
+        codes close the gap: motivo 32, pais 150/994, and qualificacao 36
+        (the legacy Gerente-Delegado code, carried by fixture empresa 99000004)."""
+        self._ensure_enriched(test_db)
+        dqr = self._report_module()
+        result = dqr.measure_enriched_orphans(test_db.conn)
+        assert result["available"] is True
+        rows = {r["label"]: r for r in result["rows"]}
+
+        motivo = rows["estabelecimentos.motivo_situacao_cadastral"]
+        assert motivo["monthly_orphans"] > motivo["enriched_orphans"], "motivo 32 should close the gap"
+
+        pais = rows["estabelecimentos.pais"]
+        assert pais["monthly_orphans"] > pais["enriched_orphans"], "pais 150/994 should close the gap"
+        assert pais["enriched_orphans"] >= 1, "spurious pais 008 must remain unresolved"
+
+        qual = rows["empresas.qualificacao_responsavel"]
+        assert qual["monthly_orphans"] > qual["enriched_orphans"], "legacy code 36 should close the gap"
+
+    def test_enriched_coverage_absent_when_tables_missing(self, test_db):
+        """When the enriched tables do not exist, the measurement degrades to
+        available=False instead of erroring."""
+        with test_db.conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS motivos_enriched")
+            cur.execute("DROP TABLE IF EXISTS paises_enriched")
+            cur.execute("DROP TABLE IF EXISTS qualificacoes_socios_enriched")
+        test_db.conn.commit()
+
+        dqr = self._report_module()
+        result = dqr.measure_enriched_orphans(test_db.conn)
+        assert result == {"available": False, "rows": []}
+
+        # restore for any later test that expects them
+        self._ensure_enriched(test_db)
+
+
+class TestRecipeCnaesHierarquia:
+    """Apply recipes/postgres/cnaes_hierarquia.sql against the fixture-loaded
+    database and verify the derived CNAE hierarchy table.
+
+    Depends on test_db being populated by TestFullPipeline (module-scoped
+    fixture; pytest runs classes in file order, so cnaes is already loaded).
+    """
+
+    RECIPE_PATH = Path(__file__).parent.parent / "recipes" / "postgres" / "cnaes_hierarquia.sql"
+
+    # Independent restatement of the official IBGE/CONCLA CNAE-Subclasses 2.3
+    # divisão->seção correspondence (Resolução CONCLA nº 2, de 19/11/2018),
+    # kept separate from the recipe's 87-pair VALUES as a double-entry check:
+    # each seção mapped to the inclusive range(s) of 2-digit divisões it owns.
+    _SECTION_RANGES = {
+        "A": [(1, 3)],
+        "B": [(5, 9)],
+        "C": [(10, 33)],
+        "D": [(35, 35)],
+        "E": [(36, 39)],
+        "F": [(41, 43)],
+        "G": [(45, 47)],
+        "H": [(49, 53)],
+        "I": [(55, 56)],
+        "J": [(58, 63)],
+        "K": [(64, 66)],
+        "L": [(68, 68)],
+        "M": [(69, 75)],
+        "N": [(77, 82)],
+        "O": [(84, 84)],
+        "P": [(85, 85)],
+        "Q": [(86, 88)],
+        "R": [(90, 93)],
+        "S": [(94, 96)],
+        "T": [(97, 97)],
+        "U": [(99, 99)],
+    }
+
+    @classmethod
+    def _expected_secao(cls, divisao: str) -> str | None:
+        n = int(divisao)
+        for secao, ranges in cls._SECTION_RANGES.items():
+            if any(lo <= n <= hi for lo, hi in ranges):
+                return secao
+        return None
+
+    def _apply(self, test_db):
+        sql = self.RECIPE_PATH.read_text()
+        with test_db.conn.cursor() as cur:
+            cur.execute(sql)
+        test_db.conn.commit()
+
+    def test_recipe_executes(self, test_db):
+        """The recipe SQL should parse and execute, creating the table."""
+        self._apply(test_db)
+        with test_db.conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'cnaes_hierarquia'")
+            assert cur.fetchone() is not None, "cnaes_hierarquia table not created"
+
+    def test_row_count_matches_cnaes(self, test_db):
+        """Grain is one row per cnaes.codigo - same cardinality as cnaes."""
+        self._apply(test_db)
+        expected = _count_rows(test_db, "cnaes")
+        got = _count_rows(test_db, "cnaes_hierarquia")
+        assert got > 0, "cnaes_hierarquia is empty (was cnaes loaded?)"
+        assert got == expected, f"cnaes_hierarquia ({got}) != cnaes ({expected})"
+
+    def test_known_example(self, test_db):
+        """Issue #94 contract: 0111301 -> divisao 01, grupo 011, classe 0111-3, secao A."""
+        self._apply(test_db)
+        with test_db.conn.cursor() as cur:
+            cur.execute(
+                "SELECT divisao, grupo, classe, secao FROM cnaes_hierarquia WHERE codigo = %s",
+                ("0111301",),
+            )
+            row = cur.fetchone()
+        assert row is not None, "0111301 missing from cnaes_hierarquia"
+        assert row == ("01", "011", "0111-3", "A"), f"unexpected derivation for 0111301: {row}"
+
+    def test_substring_fields_match_codigo(self, test_db):
+        """divisao/grupo/classe are pure substrings of the 7-digit codigo."""
+        self._apply(test_db)
+        with test_db.conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*) FROM cnaes_hierarquia
+                WHERE divisao <> left(codigo, 2)
+                   OR grupo <> left(codigo, 3)
+                   OR classe <> left(codigo, 4) || '-' || substr(codigo, 5, 1)
+            """)
+            bad = cur.fetchone()[0]
+        assert bad == 0, f"{bad} rows have substring fields inconsistent with codigo"
+
+    def test_secao_never_null_for_real_codes(self, test_db):
+        """Every real RFB CNAE code belongs to an official divisão, so secao
+        must be non-NULL for all fixture rows."""
+        self._apply(test_db)
+        with test_db.conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM cnaes_hierarquia WHERE secao IS NULL")
+            nulls = cur.fetchone()[0]
+        assert nulls == 0, f"{nulls} rows have NULL secao - a divisão is missing from the official map"
+
+    def test_secao_matches_official_map(self, test_db):
+        """Every row's secao must equal the seção the official IBGE CNAE 2.3
+        divisão->seção correspondence assigns to its divisão. Checked against an
+        independent restatement of the mapping (not imported from the recipe)."""
+        self._apply(test_db)
+        with test_db.conn.cursor() as cur:
+            cur.execute("SELECT codigo, divisao, secao FROM cnaes_hierarquia")
+            rows = cur.fetchall()
+        mismatches = [
+            (codigo, divisao, secao, self._expected_secao(divisao))
+            for codigo, divisao, secao in rows
+            if secao != self._expected_secao(divisao)
+        ]
+        assert not mismatches, f"secao mismatches vs official map: {mismatches[:10]}"
+
+    def test_codigo_is_unique(self, test_db):
+        """codigo is the natural key - one row per subclasse."""
+        self._apply(test_db)
+        with test_db.conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*), COUNT(DISTINCT codigo) FROM cnaes_hierarquia")
+            total, distinct = cur.fetchone()
+        assert total == distinct, f"codigo not unique: {total} rows, {distinct} distinct"
+
+    def test_idempotent(self, test_db):
+        """Re-running drops+recreates without error and yields the same count."""
+        self._apply(test_db)
+        before = _count_rows(test_db, "cnaes_hierarquia")
+        self._apply(test_db)
+        after = _count_rows(test_db, "cnaes_hierarquia")
+        assert before == after, f"row count changed on re-run: {before} -> {after}"

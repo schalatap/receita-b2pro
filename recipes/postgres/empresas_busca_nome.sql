@@ -26,7 +26,7 @@
 --     does not enforce that invariant and the recipe does not assume it.
 --   - cnpj column is materialized as basico||ordem||dv, the same pattern
 --     as empresa_detalhe.sql. Lets consumers point-lookup by the
---     14-digit string without repeating the concatenation.
+--     14-character string without repeating the concatenation.
 --   - Source codes are preserved alongside denormalized descriptions
 --     (municipio_codigo + municipio_nome, cnae_fiscal_principal +
 --     cnae_descricao) so consumers can re-join the reference tables
@@ -72,7 +72,7 @@ ALTER TABLE empresas_busca_nome
     PRIMARY KEY (cnpj_basico, cnpj_ordem, cnpj_dv);
 
 -- Single-column index on the materialized cnpj for callers that look
--- up by the concatenated 14-digit string instead of the component tuple.
+-- up by the concatenated 14-character string instead of the component tuple.
 CREATE INDEX IF NOT EXISTS idx_empresas_busca_nome_cnpj
     ON empresas_busca_nome (cnpj);
 
@@ -88,6 +88,21 @@ CREATE INDEX IF NOT EXISTS idx_empresas_busca_nome_razao_prefix
 CREATE INDEX IF NOT EXISTS idx_empresas_busca_nome_uf_razao
     ON empresas_busca_nome
     (uf, razao_social, cnpj_basico, cnpj_ordem);
+
+-- UF filter + LIKE 'PREFIX%' on razao_social. The default-opclass
+-- uf_razao above supports sort-by-razao under uf= equality but cannot
+-- range-scan LIKE 'PREFIX%' under non-C collations. This composite
+-- uses text_pattern_ops on razao_social so PG can enter at
+-- (uf=$1, razao_social>='PREFIX') and walk only matching rows in
+-- order — Index Only Scan, no heap fetch, sub-30ms even for broad
+-- common prefixes (e.g. 'COMERC%' over 27M rows).
+--
+-- Pairs with idx_..._razao_prefix above: that one serves uf-less
+-- prefix lookups (e.g. chat name resolution); this one serves
+-- uf-filtered search list queries.
+CREATE INDEX IF NOT EXISTS idx_empresas_busca_nome_uf_razao_prefix
+    ON empresas_busca_nome
+    (uf, razao_social text_pattern_ops, cnpj_basico, cnpj_ordem);
 
 -- UF + município (denormalized name) + sort. Indexes municipio_nome
 -- because that's typically what consumer-facing filters expose. Add a

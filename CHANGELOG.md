@@ -2,6 +2,241 @@
 
 <!-- version list -->
 
+## v1.38.3 (2026-07-09)
+
+### Bug Fixes
+
+- **downloader**: Gate every attempt on adaptive concurrency, back off no-progress retries
+  ([#102](https://github.com/caiopizzol/cnpj-data-pipeline/pull/102),
+  [`444bef0`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/444bef08072fa8d3be83edf277b2033d8f1382e0))
+
+- **downloader**: Record adaptive stalls before the stream permit releases
+  ([#102](https://github.com/caiopizzol/cnpj-data-pipeline/pull/102),
+  [`444bef0`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/444bef08072fa8d3be83edf277b2033d8f1382e0))
+
+
+## v1.38.2 (2026-07-09)
+
+### Bug Fixes
+
+- **downloader**: Reset the retry budget when a stalled attempt made progress
+  ([#101](https://github.com/caiopizzol/cnpj-data-pipeline/pull/101),
+  [`565c03e`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/565c03e437e68fa6442e94696371891c44aeaade))
+
+
+## v1.38.1 (2026-07-08)
+
+### Bug Fixes
+
+- **downloader**: Detect read timeouts by exception type, prune stale partials
+  ([#99](https://github.com/caiopizzol/cnpj-data-pipeline/pull/99),
+  [`9c412c2`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/9c412c2030e94e3622053d56629f4d6c04091a26))
+
+- **downloader**: Prune only downloader-owned resume files in shared temp dirs
+  ([#99](https://github.com/caiopizzol/cnpj-data-pipeline/pull/99),
+  [`9c412c2`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/9c412c2030e94e3622053d56629f4d6c04091a26))
+
+- **downloader**: Typed read-timeout detection and stale-partial pruning
+  ([#99](https://github.com/caiopizzol/cnpj-data-pipeline/pull/99),
+  [`9c412c2`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/9c412c2030e94e3622053d56629f4d6c04091a26))
+
+
+## v1.38.0 (2026-07-08)
+
+### Features
+
+- **downloader**: Degrade concurrency when the server stalls parallel streams
+  ([#98](https://github.com/caiopizzol/cnpj-data-pipeline/pull/98),
+  [`b4d4c75`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/b4d4c75dd9b59a7ad82b958c3bfcc065afa27734))
+
+
+## v1.37.0 (2026-07-08)
+
+### Bug Fixes
+
+- **downloader**: Only treat empty keep-alive chunks as stall evidence, document new env knobs
+  ([#97](https://github.com/caiopizzol/cnpj-data-pipeline/pull/97),
+  [`7c2e32e`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/7c2e32eec21e3d097e23fc1128cee1d39c75477c))
+
+### Features
+
+- **downloader**: Stall watchdog and periodic progress logging
+  ([#97](https://github.com/caiopizzol/cnpj-data-pipeline/pull/97),
+  [`7c2e32e`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/7c2e32eec21e3d097e23fc1128cee1d39c75477c))
+
+### Testing
+
+- **downloader**: Cover stall-mapping branches (empty-chunk raise, ConnectionError read-timeout,
+  unmapped ConnectionError) ([#97](https://github.com/caiopizzol/cnpj-data-pipeline/pull/97),
+  [`7c2e32e`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/7c2e32eec21e3d097e23fc1128cee1d39c75477c))
+
+
+## v1.36.1 (2026-07-08)
+
+### Bug Fixes
+
+- **downloader**: Crc-validate cached zips and keep .part resume state across runs
+  ([#96](https://github.com/caiopizzol/cnpj-data-pipeline/pull/96),
+  [`2579958`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/257995822e286778df4f76fe4b40ec3b073c89b4))
+
+- **downloader**: Resume large downloads instead of restarting from zero
+  ([#96](https://github.com/caiopizzol/cnpj-data-pipeline/pull/96),
+  [`2579958`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/257995822e286778df4f76fe4b40ec3b073c89b4))
+
+- **downloader**: Scope partials by month, force identity encoding on ranged downloads
+  ([#96](https://github.com/caiopizzol/cnpj-data-pipeline/pull/96),
+  [`2579958`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/257995822e286778df4f76fe4b40ec3b073c89b4))
+
+### Testing
+
+- **downloader**: Cover remaining resume branches
+  ([#96](https://github.com/caiopizzol/cnpj-data-pipeline/pull/96),
+  [`2579958`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/257995822e286778df4f76fe4b40ec3b073c89b4))
+
+- **downloader**: Cover resume error and finalize branches
+  ([#96](https://github.com/caiopizzol/cnpj-data-pipeline/pull/96),
+  [`2579958`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/257995822e286778df4f76fe4b40ec3b073c89b4))
+
+
+## v1.36.0 (2026-07-01)
+
+### Documentation
+
+- Note alphanumeric CNPJ support (v1.35.0) in README
+  ([#92](https://github.com/caiopizzol/cnpj-data-pipeline/pull/92),
+  [`c113470`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/c113470f9693d03d2196f68ad0fcd130132bbef1))
+
+- **cnpj**: Document the lowercase-input policy for alphanumeric CNPJ
+  ([#93](https://github.com/caiopizzol/cnpj-data-pipeline/pull/93),
+  [`d3ba638`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/d3ba63860e14b7c081ffa19f2a4e77e300305bc4))
+
+### Features
+
+- **recipes**: Add cnaes_hierarquia hierarchy recipe
+  ([#95](https://github.com/caiopizzol/cnpj-data-pipeline/pull/95),
+  [`b644fca`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/b644fcae123f9aecc083fd99f4424cdf6ac3a431))
+
+
+## v1.35.0 (2026-06-30)
+
+### Documentation
+
+- **cnpj**: Correct stale 14-digit wording to 14-character
+  ([#91](https://github.com/caiopizzol/cnpj-data-pipeline/pull/91),
+  [`f7839bd`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/f7839bd8ff636058ac8aa1ed9f09b69b45cd4498))
+
+### Features
+
+- **cnpj**: Support alphanumeric CNPJ (Receita 2026-07)
+  ([#91](https://github.com/caiopizzol/cnpj-data-pipeline/pull/91),
+  [`f7839bd`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/f7839bd8ff636058ac8aa1ed9f09b69b45cd4498))
+
+
+## v1.34.0 (2026-06-30)
+
+### Features
+
+- **recipes**: Socios_detalhe with sócio domain labels
+  ([`8280fb4`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/8280fb45d2d32766aded2c1d4b774ea667d95f92))
+
+
+## v1.33.0 (2026-06-30)
+
+### Features
+
+- **recipes**: Add SERPRO domain labels for porte, situacao, matriz/filial
+  ([`673c66c`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/673c66c7473b3efc803a5bcb0047ea6bda4b1f5b))
+
+
+## v1.32.0 (2026-06-29)
+
+### Bug Fixes
+
+- **recipes**: Reflect qualificacao 36 supplement and cover format_report
+  ([#87](https://github.com/caiopizzol/cnpj-data-pipeline/pull/87),
+  [`2c3eea3`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/2c3eea31f441fb62765c16151bc0e948a41674ec))
+
+### Features
+
+- **recipes**: Enriched-missing quality flags + expanded report
+  ([#87](https://github.com/caiopizzol/cnpj-data-pipeline/pull/87),
+  [`2c3eea3`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/2c3eea31f441fb62765c16151bc0e948a41674ec))
+
+- **recipes**: Enriched-missing quality flags and expanded report
+  ([#87](https://github.com/caiopizzol/cnpj-data-pipeline/pull/87),
+  [`2c3eea3`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/2c3eea31f441fb62765c16151bc0e948a41674ec))
+
+
+## v1.31.0 (2026-06-29)
+
+### Bug Fixes
+
+- **recipes**: Resolve pais 015/042 (SERPRO stores them unpadded)
+  ([#86](https://github.com/caiopizzol/cnpj-data-pipeline/pull/86),
+  [`253ed3e`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/253ed3e68b578f99ddfa8992d43e7a2105858349))
+
+- **recipes**: Resolve qualificacao 36 (legacy) and expand pais supplements
+  ([#86](https://github.com/caiopizzol/cnpj-data-pipeline/pull/86),
+  [`253ed3e`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/253ed3e68b578f99ddfa8992d43e7a2105858349))
+
+### Documentation
+
+- Add agent-facing pickled context ([#85](https://github.com/caiopizzol/cnpj-data-pipeline/pull/85),
+  [`14904ae`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/14904aee94cb3ec040973409729bc21306661483))
+
+- Fix stale prose for qualificacao 36 and supplemental sources
+  ([#86](https://github.com/caiopizzol/cnpj-data-pipeline/pull/86),
+  [`253ed3e`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/253ed3e68b578f99ddfa8992d43e7a2105858349))
+
+### Features
+
+- **recipes**: Add reference_domains_enriched, resolve supplemental codes
+  ([#86](https://github.com/caiopizzol/cnpj-data-pipeline/pull/86),
+  [`253ed3e`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/253ed3e68b578f99ddfa8992d43e7a2105858349))
+
+- **recipes**: Enriched reference domains + resolve supplemental codes
+  ([#86](https://github.com/caiopizzol/cnpj-data-pipeline/pull/86),
+  [`253ed3e`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/253ed3e68b578f99ddfa8992d43e7a2105858349))
+
+### Testing
+
+- Add pickled coverage ([#84](https://github.com/caiopizzol/cnpj-data-pipeline/pull/84),
+  [`5da70b8`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/5da70b88726cd278d14e0b6491ea574dec5ac8bc))
+
+
+## v1.30.0 (2026-05-26)
+
+### Documentation
+
+- Move socios upgrade instructions to docs/upgrading.md (#78)
+  ([#82](https://github.com/caiopizzol/cnpj-data-pipeline/pull/82),
+  [`7b2e4e7`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/7b2e4e75d5dfc58e5a93eac1edab70ef70b8548c))
+
+### Features
+
+- **recipes**: Add uf+razao text_pattern_ops composite index
+  ([#83](https://github.com/caiopizzol/cnpj-data-pipeline/pull/83),
+  [`bca0a8b`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/bca0a8b15442451d9cb56c7496faa8ceb2e70f9b))
+
+
+## v1.29.1 (2026-05-26)
+
+### Bug Fixes
+
+- **socios**: Switch PK to deterministic socio_id (#78)
+  ([#81](https://github.com/caiopizzol/cnpj-data-pipeline/pull/81),
+  [`0f72d67`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/0f72d67ddcc8cc6b9cc38649ded8570add3f7200))
+
+
+## v1.29.0 (2026-05-25)
+
+### Features
+
+- **database**: Pass DATABASE_URL DSN through to psycopg2 (#79)
+  ([#80](https://github.com/caiopizzol/cnpj-data-pipeline/pull/80),
+  [`f0cc085`](https://github.com/caiopizzol/cnpj-data-pipeline/commit/f0cc08589c0fa45746b24ffd931ffab953bd7653))
+
+
 ## v1.28.0 (2026-05-24)
 
 ### Features

@@ -20,6 +20,9 @@
 > [!IMPORTANT]
 > **Desde v1.3.2** — _A Receita Federal migrou os arquivos CNPJ para um novo repositório Nextcloud. Esta versão já suporta a nova URL e realiza downloads via WebDAV automaticamente. Nenhuma configuração adicional necessária._
 
+> [!IMPORTANT]
+> **Desde v1.35.0** — _Suporte ao CNPJ alfanumérico da Receita Federal, previsto para novas inscrições a partir de julho de 2026. `cnpj_basico` e `cnpj_ordem` aceitam `0-9` e `A-Z`; `cnpj_dv` continua numérico. CNPJs numéricos existentes seguem compatíveis sem mudança._
+
 > [!TIP]
 > **Novo** — _Estratégia de carga configurável. Use `LOADING_STRATEGY=replace` para carga completa mais rápida (TRUNCATE + INSERT) ou `upsert` (default) para manter disponibilidade durante a carga._
 
@@ -106,6 +109,8 @@ RETRY_ATTEMPTS=3
 RETRY_DELAY=5
 CONNECT_TIMEOUT=30
 READ_TIMEOUT=300
+STALL_TIMEOUT=30
+PROGRESS_LOG_INTERVAL=30
 KEEP_DOWNLOADED_FILES=false
 LOADING_STRATEGY=upsert  # "upsert" ou "replace"
 OUTPUT_FORMAT=postgres   # "postgres" ou "parquet"
@@ -113,6 +118,25 @@ PARQUET_OUTPUT_DIR=./parquet
 PARQUET_TYPED_OUTPUT=false  # Quando true, datas e numéricos saem tipados (Date, Float64, Int32)
 PROCESS_WORKERS=1        # Arquivos do mesmo grupo em paralelo (ex: 4)
 ```
+
+### `DATABASE_URL`: parâmetros libpq
+
+O `DATABASE_URL` é repassado direto ao driver, então qualquer parâmetro suportado pelo libpq funciona via query string. Útil para Postgres gerenciado (Railway, RDS, Supabase, Neon) e para isolar o pipeline em um schema próprio.
+
+Sempre coloque o valor entre aspas no shell: o `&` da query string é metacaractere e, sem aspas, faz o bash colocar o comando em background.
+
+```bash
+# SSL obrigatório
+DATABASE_URL='postgres://user:pass@host:5432/cnpj?sslmode=require'
+
+# Pipeline em schema separado
+DATABASE_URL='postgres://user:pass@host:5432/cnpj?options=-c%20search_path%3Dcnpj'
+
+# Combinado
+DATABASE_URL='postgres://user:pass@host:5432/cnpj?sslmode=require&options=-c%20search_path%3Dcnpj'
+```
+
+Sobre `search_path`: o schema precisa existir antes (`CREATE SCHEMA cnpj;`), o libpq não cria. Se você incluir `public` como fallback (`search_path=cnpj,public`) e o `public` já tiver tabelas do pipeline de uma execução anterior, o bootstrap (`ensure_schema`) detecta as tabelas no `public` e não cria nada no `cnpj`. Para isolamento estrito, deixe só `cnpj` no `search_path`, ou use um banco novo.
 
 ### Estratégia de carga (PostgreSQL)
 
@@ -169,6 +193,11 @@ EMPRESAS (1) ─── (N) ESTABELECIMENTOS
          ├─── (N) SOCIOS
          └─── (1) DADOS_SIMPLES
 ```
+
+> [!IMPORTANT]
+> Se você já carregou dados antes da mudança para `socios.socio_id`, recrie `socios` e as receitas derivadas (`socios_quality_flags`, `socios_clean`) para preservar sócios com CPF mascarado ou documento ausente.
+>
+> Veja o passo a passo em [docs/upgrading.md](docs/upgrading.md#sociossocio_id).
 
 ## Fonte de Dados
 
