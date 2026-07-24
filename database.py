@@ -127,11 +127,13 @@ class Database:
                 f"CREATE TABLE IF NOT EXISTS {self._PENDING_TBL} "
                 "(indexname text PRIMARY KEY, indexdef text NOT NULL)"
             )
-            cur.execute(f"TRUNCATE {self._PENDING_TBL}")
+            # Upsert (sem TRUNCATE): pendências de um run anterior que falharam na
+            # recuperação sobrevivem e são retentadas ao final desta carga.
             for indexes in saved_indexes.values():
                 for idx in indexes:
                     cur.execute(
-                        f"INSERT INTO {self._PENDING_TBL} (indexname, indexdef) VALUES (%s, %s)",
+                        f"INSERT INTO {self._PENDING_TBL} (indexname, indexdef) VALUES (%s, %s) "
+                        "ON CONFLICT (indexname) DO UPDATE SET indexdef = EXCLUDED.indexdef",
                         (idx["indexname"], idx["indexdef"]),
                     )
         self.conn.commit()
@@ -140,6 +142,11 @@ class Database:
         with self.conn.cursor() as cur:
             cur.execute(f"DROP TABLE IF EXISTS {self._PENDING_TBL}")
         self.conn.commit()
+
+    @staticmethod
+    def _already_exists(exc: psycopg2.Error) -> bool:
+        """42P07 = índice/tabela já existe; 42710 = constraint já existe."""
+        return exc.pgcode in ("42P07", "42710")
 
     def recover_pending_indexes(self) -> int:
         """Recupera índices de um run anterior interrompido entre drop e recreate.
@@ -157,47 +164,118 @@ class Database:
             self._clear_pending_indexes()
             return 0
         logger.warning(f"Recuperando {len(pending)} índices de um run interrompido...")
+        recovered = 0
         for indexname, indexdef in pending:
             with self.conn.cursor() as cur:
                 try:
                     cur.execute(indexdef)
+                    cur.execute(f"DELETE FROM {self._PENDING_TBL} WHERE indexname = %s", (indexname,))
                     self.conn.commit()
+                    recovered += 1
                     logger.info(f"  Recriado {indexname}")
                 except psycopg2.Error as e:
                     self.conn.rollback()
-                    logger.warning(f"  Falhou {indexname}: {e}")
-        self._clear_pending_indexes()
-        return len(pending)
+                    if self._already_exists(e):
+                        with self.conn.cursor() as cur2:
+                            cur2.execute(f"DELETE FROM {self._PENDING_TBL} WHERE indexname = %s", (indexname,))
+                        self.conn.commit()
+                        recovered += 1
+                        logger.info(f"  {indexname} já existia — pendência descartada")
+                    else:
+                        # Mantém a pendência (ex.: PK que falha por duplicatas pré-dedupe);
+                        # create_all_indexes_after_bulk_load retentará após a próxima carga.
+                        logger.warning(f"  Falhou {indexname} (mantido como pendência): {e}")
+        if recovered == len(pending):
+            self._clear_pending_indexes()
+        return recovered
+
+    def _get_pk_constraint(self, table_name: str) -> dict | None:
+        """Retorna a constraint de PK como statement executável + colunas, ou None."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT conname, pg_get_constraintdef(oid)
+                FROM pg_constraint
+                WHERE contype = 'p' AND conrelid = %s::regclass
+                """,
+                (table_name,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        conname, condef = row  # condef: "PRIMARY KEY (col1, col2)"
+        columns = [c.strip() for c in condef[condef.index("(") + 1 : condef.rindex(")")].split(",")]
+        return {
+            "indexname": conname,
+            "indexdef": f"ALTER TABLE {table_name} ADD CONSTRAINT {conname} {condef}",
+            "pk_table": table_name,
+            "pk_columns": columns,
+        }
 
     def drop_all_indexes_for_bulk_load(self) -> dict:
-        """Dropa índices não-PK das tabelas grandes p/ acelerar a carga.
+        """Dropa índices não-PK E a constraint de PK das tabelas grandes.
 
-        Persiste as defs em tabela de metadados ANTES de dropar (crash-safe).
-        Retorna {table_name: [definições]} para recriação posterior.
+        Sem a PK, todos os batches entram por COPY direto (bulk_insert) — sem
+        temp table, sort ou ON CONFLICT. As raras duplicatas cross-shard da RFB
+        são removidas no dedupe de create_all_indexes_after_bulk_load, antes de
+        recriar a PK. Persiste as defs em tabela de metadados ANTES de dropar
+        (crash-safe). Retorna {table_name: [definições]} (PK primeiro).
         """
         large_tables = ["empresas", "estabelecimentos", "socios", "dados_simples"]
         saved_indexes = {}
         self.connect()
         for table in large_tables:
-            indexes = self.get_table_indexes(table)
-            if indexes:
-                saved_indexes[table] = indexes
+            entries = []
+            pk = self._get_pk_constraint(table)
+            if pk:
+                entries.append(pk)
+            entries.extend(self.get_table_indexes(table))
+            if entries:
+                saved_indexes[table] = entries
         if not saved_indexes:
             return {}
         # 1) Persistir defs ANTES de dropar (recuperável mesmo se o processo morrer).
         self._persist_pending_indexes(saved_indexes)
-        # 2) Dropar.
-        for table, indexes in saved_indexes.items():
+        # 2) Dropar (PK via DROP CONSTRAINT; demais via DROP INDEX).
+        for table, entries in saved_indexes.items():
             with self.conn.cursor() as cur:
-                for idx in indexes:
-                    cur.execute(f"DROP INDEX IF EXISTS {idx['indexname']}")
+                for idx in entries:
+                    if "pk_columns" in idx:
+                        cur.execute(f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {idx['indexname']}")
+                    else:
+                        cur.execute(f"DROP INDEX IF EXISTS {idx['indexname']}")
             self.conn.commit()
-            logger.info(f"Dropped {len(indexes)} indexes from {table}")
+            logger.info(f"Dropped {len(entries)} indexes/PK from {table}")
         self._index_cache.clear()
+        self._pk_cache.clear()  # bulk_insert passa a ver a tabela sem PK → COPY direto
         return saved_indexes
 
+    def _dedupe_table(self, table_name: str, pk_columns: List[str]):
+        """Remove duplicatas cross-shard da RFB antes de recriar a PK.
+
+        Mantém uma ocorrência arbitrária (as duplicatas são linhas idênticas ou
+        lixo da fonte). Um passo de sort sobre a tabela — mesma ordem de custo da
+        criação da PK que vem em seguida.
+        """
+        pk_str = ", ".join(f'"{c}"' for c in pk_columns)
+        with self.conn.cursor() as cur:
+            cur.execute(
+                f"""
+                DELETE FROM {table_name} WHERE ctid IN (
+                    SELECT ctid FROM (
+                        SELECT ctid, row_number() OVER (PARTITION BY {pk_str} ORDER BY ctid) AS rn
+                        FROM {table_name}
+                    ) d WHERE d.rn > 1
+                )
+                """
+            )
+            removed = cur.rowcount
+        self.conn.commit()
+        if removed:
+            logger.warning(f"  {table_name}: {removed} duplicata(s) de PK removida(s) antes da recriação")
+
     def create_all_indexes_after_bulk_load(self, saved_indexes: dict):
-        """Recria os índices após a carga."""
+        """Dedupe + recriação de PK e índices após a carga."""
         if not saved_indexes:
             return
         self.connect()
@@ -208,19 +286,55 @@ class Database:
         self.conn.commit()
         total = sum(len(idxs) for idxs in saved_indexes.values())
         logger.info(f"Creating {total} indexes...")
-        for table, indexes in saved_indexes.items():
-            logger.info(f"Creating {len(indexes)} indexes on {table}...")
-            with self.conn.cursor() as cur:
-                for idx in indexes:
+        created = set()
+        for table, entries in saved_indexes.items():
+            logger.info(f"Creating {len(entries)} indexes on {table}...")
+            for idx in entries:
+                with self.conn.cursor() as cur:
                     try:
+                        if "pk_columns" in idx:
+                            self._dedupe_table(table, idx["pk_columns"])
                         cur.execute(idx["indexdef"])
+                        cur.execute(
+                            f"DELETE FROM {self._PENDING_TBL} WHERE indexname = %s",
+                            (idx["indexname"],),
+                        )
                         self.conn.commit()
+                        created.add(idx["indexname"])
                         logger.info(f"  Created {idx['indexname']}")
                     except psycopg2.Error as e:
                         self.conn.rollback()
                         logger.warning(f"  Failed {idx['indexname']}: {e}")
+        # Retenta pendências herdadas de runs anteriores (ex.: PK que o recover não
+        # conseguiu recriar por duplicatas — os dados agora estão limpos).
+        with self.conn.cursor() as cur:
+            cur.execute(f"SELECT indexname, indexdef FROM {self._PENDING_TBL}")
+            leftovers = [r for r in cur.fetchall() if r[0] not in created]
+        for indexname, indexdef in leftovers:
+            with self.conn.cursor() as cur:
+                try:
+                    cur.execute(indexdef)
+                    cur.execute(f"DELETE FROM {self._PENDING_TBL} WHERE indexname = %s", (indexname,))
+                    self.conn.commit()
+                    logger.info(f"  Recuperado (pendência antiga): {indexname}")
+                except psycopg2.Error as e:
+                    self.conn.rollback()
+                    if self._already_exists(e):
+                        with self.conn.cursor() as cur:
+                            cur.execute(f"DELETE FROM {self._PENDING_TBL} WHERE indexname = %s", (indexname,))
+                        self.conn.commit()
+                        logger.info(f"  Pendência antiga {indexname} já existia — descartada")
+                    else:
+                        logger.warning(f"  Pendência antiga ainda falhando {indexname}: {e}")
         logger.info("All indexes created!")
-        self._clear_pending_indexes()
+        # Só descarta a tabela de pendências se nada ficou para trás.
+        with self.conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM {self._PENDING_TBL}")
+            remaining = cur.fetchone()[0]
+        if remaining == 0:
+            self._clear_pending_indexes()
+        else:
+            logger.warning(f"{remaining} índice(s)/PK ainda pendente(s) — mantidos para o próximo run")
 
     def ensure_schema(self):
         """Apply initial.sql if the schema tables don't exist yet.
@@ -345,17 +459,23 @@ class Database:
                     # Target is empty - direct COPY is safe and fastest.
                     self._copy_to_temp(cur, df, table_name, columns)
                 else:
-                    # Cross-batch PK overlap path. Same temp-then-upsert
-                    # pattern as bulk_upsert.
-                    temp_table = f"{table_name}_tmp_{os.getpid()}"
-                    cur.execute(
-                        f"CREATE TEMP TABLE IF NOT EXISTS {temp_table} "
-                        f"(LIKE {table_name} INCLUDING DEFAULTS INCLUDING STORAGE) ON COMMIT DROP"
-                    )
-                    cur.execute(f"TRUNCATE {temp_table}")
-                    self._copy_to_temp(cur, df, temp_table, columns)
                     primary_keys = self._get_primary_keys(cur, table_name)
-                    self._upsert_from_temp(cur, temp_table, table_name, columns, primary_keys)
+                    if not primary_keys:
+                        # PK dropada para a carga (drop_all_indexes_for_bulk_load):
+                        # COPY direto — duplicatas cross-shard são removidas no
+                        # dedupe antes da recriação da PK.
+                        self._copy_to_temp(cur, df, table_name, columns)
+                    else:
+                        # Cross-batch PK overlap path. Same temp-then-upsert
+                        # pattern as bulk_upsert.
+                        temp_table = f"{table_name}_tmp_{os.getpid()}"
+                        cur.execute(
+                            f"CREATE TEMP TABLE IF NOT EXISTS {temp_table} "
+                            f"(LIKE {table_name} INCLUDING DEFAULTS INCLUDING STORAGE) ON COMMIT DROP"
+                        )
+                        cur.execute(f"TRUNCATE {temp_table}")
+                        self._copy_to_temp(cur, df, temp_table, columns)
+                        self._upsert_from_temp(cur, temp_table, table_name, columns, primary_keys)
 
                 self.conn.commit()
 
