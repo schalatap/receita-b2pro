@@ -191,8 +191,24 @@ class Downloader:
         return self.get_available_directories()[-1]
 
     def get_directory_files(self, directory: str) -> List[str]:
-        """Get list of ZIP files in a directory."""
-        root = self._propfind(directory)
+        """Get list of ZIP files in a directory.
+
+        Se o WebDAV da RFB estiver fora (falha crônica) e houver ZIPs no cache
+        local (KEEP_DOWNLOADED_FILES=true, ex. pré-download via mirror), usa a
+        listagem do disco — o processamento segue 100% do cache.
+        """
+        try:
+            root = self._propfind(directory)
+        except requests.RequestException as exc:
+            if self.config.keep_files:
+                local = sorted(p.name for p in self.temp_path.glob("*.zip"))
+                if local:
+                    logger.warning(
+                        f"WebDAV indisponível ({exc}); usando {len(local)} ZIPs do cache local "
+                        f"em {self.temp_path} — confira que pertencem ao lote {directory}"
+                    )
+                    return local
+            raise
 
         files = []
         for response in root.findall("d:response", DAV_NS):
