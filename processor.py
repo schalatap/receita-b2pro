@@ -8,7 +8,7 @@ import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Generator, List, Optional, Tuple
+from typing import Dict, Generator, List, Optional, Tuple
 
 import polars as pl
 
@@ -115,6 +115,16 @@ OUTPUT_COLUMNS = {
 
 def _output_columns(file_type: str) -> List[str]:
     return OUTPUT_COLUMNS.get(file_type, COLUMNS[file_type])
+
+
+def expected_table_columns() -> Dict[str, List[str]]:
+    """Colunas que a carga vai escrever, por tabela de destino.
+
+    Fonte de verdade do pré-voo de schema (`Database.verify_schema`): é
+    exatamente o que o COPY envia, então divergência aqui é falha garantida —
+    e o pré-voo precisa detectá-la ANTES do TRUNCATE.
+    """
+    return {FILE_MAPPINGS[ft]: _output_columns(ft) for ft in FILE_MAPPINGS}
 
 
 def get_file_type(filename: str) -> Optional[str]:

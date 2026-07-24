@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import List, Set
+from typing import Dict, List, Set
 
 import polars as pl
 import psycopg2
@@ -335,6 +335,37 @@ class Database:
             self._clear_pending_indexes()
         else:
             logger.warning(f"{remaining} índice(s)/PK ainda pendente(s) — mantidos para o próximo run")
+
+    def verify_schema(self, expected: Dict[str, List[str]]) -> List[str]:
+        """Pré-voo: confere se as tabelas de destino aceitam o que a carga escreve.
+
+        `ensure_schema` só faz bootstrap (sai cedo se o banco já foi inicializado),
+        então um upgrade de versão que mude o schema deixa a base antiga intacta e
+        divergente. Sem esta checagem a divergência só aparece no meio da carga —
+        DEPOIS do TRUNCATE, com a tabela já vazia. Foi o que aconteceu em
+        2026-07-24: `socios` perdeu 27,8M linhas porque o v1.38 escreve `socio_id`
+        e a tabela de produção ainda tinha o `id` serial do v1.28.
+
+        Retorna a lista de problemas (vazia = compatível). Não levanta exceção:
+        quem chama decide como reportar e abortar.
+        """
+        self.connect()
+        problemas: List[str] = []
+        with self.conn.cursor() as cur:
+            for tabela, colunas in sorted(expected.items()):
+                cur.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = %s",
+                    (tabela,),
+                )
+                reais = {row[0] for row in cur.fetchall()}
+                if not reais:
+                    problemas.append(f"{tabela}: tabela ausente")
+                    continue
+                ausentes = [c for c in colunas if c not in reais]
+                if ausentes:
+                    problemas.append(f"{tabela}: colunas ausentes {ausentes}")
+        return problemas
 
     def ensure_schema(self):
         """Apply initial.sql if the schema tables don't exist yet.

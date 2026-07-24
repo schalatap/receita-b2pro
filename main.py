@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 from config import config
 from downloader import Downloader
-from processor import FILE_MAPPINGS, get_file_type, process_file
+from processor import FILE_MAPPINGS, expected_table_columns, get_file_type, process_file
 
 # Configure logging
 logging.basicConfig(
@@ -192,6 +192,17 @@ def main():
             fast_load=(config.loading_strategy == "replace"),
         )
         db.ensure_schema()
+        # Pré-voo de schema: aborta ANTES do TRUNCATE se a base divergir do que a
+        # carga escreve. `ensure_schema` não migra base já inicializada, então um
+        # upgrade de versão pode deixar tabela incompatível — e sem esta checagem
+        # o erro só aparece com a tabela já truncada e vazia.
+        problemas = db.verify_schema(expected_table_columns())
+        if problemas:
+            logger.error("Schema incompatível com esta versão do pipeline — abortando ANTES de truncar:")
+            for p in problemas:
+                logger.error(f"  - {p}")
+            logger.error("Migre o schema (ver initial.sql) e rode de novo. Nenhum dado foi alterado.")
+            sys.exit(1)
         # Recupera índices se um run anterior caiu entre drop e recreate (crash-safe).
         db.recover_pending_indexes()
 
