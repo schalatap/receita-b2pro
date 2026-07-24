@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import logging
+import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -149,6 +150,13 @@ def _parquet_worker(zip_filename, directory, downloader, parquet, cfg):
 def main():
     """Main pipeline entry point."""
     args = parse_args()
+
+    # Spill temporário do polars vai para TEMP_DIR (disco grande), não /tmp:
+    # em sistemas com /tmp em tmpfs com quota por usuário (ex. Ubuntu 26.04),
+    # N workers em paralelo estouram a cota → EDQUOT e a carga aborta.
+    temp_abs = Path(config.temp_dir).resolve()
+    temp_abs.mkdir(exist_ok=True)
+    os.environ.setdefault("TMPDIR", str(temp_abs))
 
     downloader = Downloader(config)
 
