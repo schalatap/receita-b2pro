@@ -55,7 +55,7 @@ class Database:
                 # synchronous_commit=off só na recarga completa (fast_load), p/ não
                 # arriscar perda silenciosa de durabilidade no modo upsert/incremental.
                 with self.conn.cursor() as cur:
-                    cur.execute("SET maintenance_work_mem = '512MB'")
+                    cur.execute("SET maintenance_work_mem = '1GB'")
                     if self.fast_load:
                         cur.execute("SET synchronous_commit = off")
                 self.conn.commit()
@@ -81,7 +81,7 @@ class Database:
         """Reaplica tuning de sessão para carga (idempotente; connect() já aplica)."""
         self.connect()
         with self.conn.cursor() as cur:
-            cur.execute("SET maintenance_work_mem = '512MB'")
+            cur.execute("SET maintenance_work_mem = '1GB'")
             cur.execute("SET synchronous_commit = off")
         self.conn.commit()
         logger.info("PostgreSQL bulk load configuration applied")
@@ -201,6 +201,11 @@ class Database:
         if not saved_indexes:
             return
         self.connect()
+        with self.conn.cursor() as cur:
+            # Paraleliza o sort/build de cada índice (o servidor limita ao pool
+            # de max_parallel_workers; inofensivo onde não houver folga).
+            cur.execute("SET max_parallel_maintenance_workers = 4")
+        self.conn.commit()
         total = sum(len(idxs) for idxs in saved_indexes.values())
         logger.info(f"Creating {total} indexes...")
         for table, indexes in saved_indexes.items():
