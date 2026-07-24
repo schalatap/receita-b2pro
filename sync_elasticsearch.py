@@ -6,23 +6,31 @@ Otimizações aplicadas:
 - Keyset pagination (sem OFFSET lento)
 - Sócios em batch com ANY()
 - Multiprocessing: N workers dividem o keyspace do CNPJ
-- parallel_bulk: 2 threads por worker para envio ao ES
+- Producer/consumer por worker: thread produtora busca no PG enquanto a
+  principal envia ao ES (sobrepõe os dois I/Os sem worker extra)
+- streaming_bulk com retry/backoff (429 e erros transientes)
 - Batch sizes otimizados (20k PG, 3k ES)
-- translog.durability=async durante bulk
+- translog.durability=async durante bulk; force_merge ao final
+
+Robustez:
+- Worker sai com exit code 1 se qualquer doc falhar após retries
+- Swap do alias abortado se um worker falhar ou docs < 99,5% do esperado
 """
 
 import logging
 import os
+import queue
 import sys
 import time
 from datetime import datetime
 from collections import defaultdict
 from multiprocessing import Process, Value
+from threading import Thread
 
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import NamedTupleCursor
 from elasticsearch import Elasticsearch
-from elasticsearch.helpers import parallel_bulk
+from elasticsearch.helpers import streaming_bulk
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -34,13 +42,14 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.getenv('DATABASE_URL', 'postgres://cnpj_user:cnpj_pass@localhost:5432/cnpj')
 ES_HOST = os.getenv('ES_HOST', 'https://localhost:9200')
 ES_USER = os.getenv('ES_USER', 'elastic')
-ES_PASS = os.getenv('ES_PASS', '=6npk3H78C+OWEfpyd1u')
+ES_PASS = os.getenv('ES_PASS', '')  # obrigatório — sem default por segurança
 INDEX_NAME = 'empresas_b2b'
 
 NUM_WORKERS = int(os.getenv('SYNC_WORKERS', '4'))
 BATCH_SIZE = 20000
 ES_CHUNK = 3000
-BULK_THREADS = 2  # threads por worker para parallel_bulk
+PREFETCH_BATCHES = 2   # batches PG enfileirados à frente do envio ao ES
+MIN_DOC_RATIO = 0.995  # swap abortado se docs indexados < 99,5% do esperado
 
 PORTE = {'00': 'Não Informado', '01': 'Micro Empresa', '03': 'EPP', '05': 'Demais'}
 SITUACAO = {'01': 'Nula', '02': 'Ativa', '03': 'Suspensa', '04': 'Inapta', '08': 'Baixada'}
@@ -164,122 +173,151 @@ def fetch_socios(conn, cnpjs):
 
 
 def transform(row, socios, index_name):
-    capital = float(row['capital_social']) if row['capital_social'] else 0
+    capital = float(row.capital_social) if row.capital_social else 0
 
     location = None
-    if row['municipio_lat'] and row['municipio_lon']:
+    if row.municipio_lat and row.municipio_lon:
         location = {
-            'lat': float(row['municipio_lat']),
-            'lon': float(row['municipio_lon'])
+            'lat': float(row.municipio_lat),
+            'lon': float(row.municipio_lon)
         }
 
     return {
         '_index': index_name,
-        '_id': row['cnpj'],
+        '_id': row.cnpj,
         '_source': {
-            'cnpj': row['cnpj'],
-            'cnpj_basico': row['cnpj_basico'],
-            'razao_social': row['razao_social'],
-            'nome_fantasia': row['nome_fantasia'],
-            'situacao_cadastral': row['situacao_cadastral'],
-            'situacao_descricao': SITUACAO.get(row['situacao_cadastral']),
-            'data_situacao': fmt_date(row['data_situacao_cadastral']),
-            'data_inicio_atividade': fmt_date(row['data_inicio_atividade']),
-            'cnae_principal': row['cnae_fiscal_principal'],
-            'cnae_descricao': row['cnae_descricao'],
-            'cnae_divisao': row['cnae_divisao'],
-            'cnaes_secundarios': row['cnae_fiscal_secundaria'].split(',') if row['cnae_fiscal_secundaria'] else [],
-            'natureza_juridica': row['natureza_juridica'],
-            'natureza_descricao': row['natureza_descricao'],
-            'porte': row['porte'],
-            'porte_descricao': PORTE.get(row['porte']),
+            'cnpj': row.cnpj,
+            'cnpj_basico': row.cnpj_basico,
+            'razao_social': row.razao_social,
+            'nome_fantasia': row.nome_fantasia,
+            'situacao_cadastral': row.situacao_cadastral,
+            'situacao_descricao': SITUACAO.get(row.situacao_cadastral),
+            'data_situacao': fmt_date(row.data_situacao_cadastral),
+            'data_inicio_atividade': fmt_date(row.data_inicio_atividade),
+            'cnae_principal': row.cnae_fiscal_principal,
+            'cnae_descricao': row.cnae_descricao,
+            'cnae_divisao': row.cnae_divisao,
+            'cnaes_secundarios': row.cnae_fiscal_secundaria.split(',') if row.cnae_fiscal_secundaria else [],
+            'natureza_juridica': row.natureza_juridica,
+            'natureza_descricao': row.natureza_descricao,
+            'porte': row.porte,
+            'porte_descricao': PORTE.get(row.porte),
             'capital_social': capital,
             'faixa_capital': faixa_capital(capital),
-            'matriz_filial': 'Matriz' if str(row['identificador_matriz_filial']) == '1' else 'Filial',
+            'matriz_filial': 'Matriz' if str(row.identificador_matriz_filial) == '1' else 'Filial',
             'endereco': {
-                'logradouro': f"{row['tipo_logradouro'] or ''} {row['logradouro'] or ''}".strip(),
-                'numero': row['numero'],
-                'complemento': row['complemento'],
-                'bairro': row['bairro'],
-                'cep': row['cep'],
-                'municipio': row['municipio'],
-                'municipio_nome': row['municipio_nome'],
-                'uf': row['uf']
+                'logradouro': f"{row.tipo_logradouro or ''} {row.logradouro or ''}".strip(),
+                'numero': row.numero,
+                'complemento': row.complemento,
+                'bairro': row.bairro,
+                'cep': row.cep,
+                'municipio': row.municipio,
+                'municipio_nome': row.municipio_nome,
+                'uf': row.uf
             },
             'contato': {
-                'telefone_1': row['telefone_1'],
-                'telefone_2': row['telefone_2'],
-                'email': row['email'].lower() if row['email'] else None,
-                'tem_email': bool(row['email']),
-                'tem_telefone': bool(row['telefone_1'])
+                'telefone_1': row.telefone_1,
+                'telefone_2': row.telefone_2,
+                'email': row.email.lower() if row.email else None,
+                'tem_email': bool(row.email),
+                'tem_telefone': bool(row.telefone_1)
             },
             'simples': {
-                'optante_simples': row['opcao_pelo_simples'],
-                'optante_mei': row['opcao_pelo_mei'],
-                'data_opcao_simples': fmt_date(row['data_opcao_pelo_simples']),
-                'data_opcao_mei': fmt_date(row['data_opcao_pelo_mei'])
+                'optante_simples': row.opcao_pelo_simples,
+                'optante_mei': row.opcao_pelo_mei,
+                'data_opcao_simples': fmt_date(row.data_opcao_pelo_simples),
+                'data_opcao_mei': fmt_date(row.data_opcao_pelo_mei)
             },
             'socios': socios,
             'qtd_socios': len(socios),
-            'municipio_populacao': row['municipio_populacao'],
-            'municipio_regiao': row['municipio_regiao'],
-            'municipio_mesorregiao': row['municipio_mesorregiao'],
-            'municipio_microrregiao': row['municipio_microrregiao'],
-            'municipio_capital': row['municipio_capital'] or False,
+            'municipio_populacao': row.municipio_populacao,
+            'municipio_regiao': row.municipio_regiao,
+            'municipio_mesorregiao': row.municipio_mesorregiao,
+            'municipio_microrregiao': row.municipio_microrregiao,
+            'municipio_capital': row.municipio_capital or False,
             'location': location,
-            'tem_divida_ativa': bool(row.get('pgfn_divida_total') and float(row['pgfn_divida_total']) > 0),
-            'divida_total': float(row['pgfn_divida_total']) if row.get('pgfn_divida_total') else None,
-            'qtd_inscricoes_pgfn': row.get('pgfn_qtd_inscricoes') or 0,
-            'qtd_ajuizadas_pgfn': row.get('pgfn_qtd_ajuizadas') or 0,
-            'empresa_capital_aberto': bool(row.get('cvm_capital_aberto')),
-            'setor_cvm': row.get('cvm_setor'),
-            'receita_liquida': float(row['cvm_receita']) if row.get('cvm_receita') else None,
-            'lucro_liquido': float(row['cvm_lucro']) if row.get('cvm_lucro') else None,
+            'tem_divida_ativa': bool(row.pgfn_divida_total and float(row.pgfn_divida_total) > 0),
+            'divida_total': float(row.pgfn_divida_total) if row.pgfn_divida_total else None,
+            'qtd_inscricoes_pgfn': row.pgfn_qtd_inscricoes or 0,
+            'qtd_ajuizadas_pgfn': row.pgfn_qtd_ajuizadas or 0,
+            'empresa_capital_aberto': bool(row.cvm_capital_aberto),
+            'setor_cvm': row.cvm_setor,
+            'receita_liquida': float(row.cvm_receita) if row.cvm_receita else None,
+            'lucro_liquido': float(row.cvm_lucro) if row.cvm_lucro else None,
         }
     }
 
 
-def generate_docs(conn, range_start, range_end, index_name, counter):
-    """Gera documentos ES para uma faixa do keyspace CNPJ."""
+def batch_producer(conn, range_start, range_end, out_queue):
+    """Thread produtora: busca batches no PG (empresas + sócios) e enfileira.
+
+    Todo acesso psycopg2 acontece aqui — a conexão nunca cruza threads.
+    Sentinela: None = fim da faixa; Exception = falha a propagar no consumidor.
+    """
     last_basico, last_ordem, last_dv = '', '', ''
+    try:
+        while True:
+            with conn.cursor(cursor_factory=NamedTupleCursor) as cur:
+                cur.execute(QUERY_EMPRESAS, (range_start, range_end, last_basico, last_ordem, last_dv, BATCH_SIZE))
+                rows = cur.fetchall()
 
+            if not rows:
+                out_queue.put(None)
+                return
+
+            cnpjs_basicos = list({r.cnpj_basico for r in rows})
+            socios_map = fetch_socios(conn, cnpjs_basicos)
+            out_queue.put((rows, socios_map))
+
+            last_row = rows[-1]
+            last_basico = last_row.cnpj_basico
+            last_ordem = last_row.cnpj[8:12]
+            last_dv = last_row.cnpj[12:14]
+    except Exception as exc:
+        out_queue.put(exc)
+
+
+def generate_docs(batch_queue, index_name, counter):
+    """Consome batches da fila e gera documentos ES (prefetch: PG e ES sobrepostos)."""
     while True:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(QUERY_EMPRESAS, (range_start, range_end, last_basico, last_ordem, last_dv, BATCH_SIZE))
-            rows = cur.fetchall()
+        item = batch_queue.get()
+        if item is None:
+            return
+        if isinstance(item, Exception):
+            raise item
 
-        if not rows:
-            break
-
-        cnpjs_basicos = list({r['cnpj_basico'] for r in rows})
-        socios_map = fetch_socios(conn, cnpjs_basicos)
-
+        rows, socios_map = item
         for row in rows:
-            socios = socios_map.get(row['cnpj_basico'], [])
+            socios = socios_map.get(row.cnpj_basico, [])
             yield transform(row, socios, index_name)
 
         with counter.get_lock():
             counter.value += len(rows)
 
-        last_row = rows[-1]
-        last_basico = last_row['cnpj_basico']
-        last_ordem = last_row['cnpj'][8:12]
-        last_dv = last_row['cnpj'][12:14]
-
 
 def worker_process(worker_id, range_start, range_end, index_name, counter):
-    """Worker: indexa uma faixa do keyspace CNPJ."""
+    """Worker: indexa uma faixa do keyspace CNPJ. Sai com código 1 se perder docs."""
     logger.info(f"Worker {worker_id}: cnpj_basico [{range_start}, {range_end})")
 
     conn = psycopg2.connect(DATABASE_URL)
     conn.set_session(readonly=True)
     es = Elasticsearch(ES_HOST, basic_auth=(ES_USER, ES_PASS), verify_certs=False)
 
+    batch_queue = queue.Queue(maxsize=PREFETCH_BATCHES)
+    producer = Thread(
+        target=batch_producer,
+        args=(conn, range_start, range_end, batch_queue),
+        daemon=True,
+    )
+    producer.start()
+
     success, failed = 0, 0
-    for ok, result in parallel_bulk(
-        es, generate_docs(conn, range_start, range_end, index_name, counter),
+    for ok, result in streaming_bulk(
+        es, generate_docs(batch_queue, index_name, counter),
         chunk_size=ES_CHUNK,
-        thread_count=BULK_THREADS,
+        max_retries=8,
+        initial_backoff=2,
+        max_backoff=60,
         raise_on_error=False,
         raise_on_exception=False,
     ):
@@ -290,8 +328,13 @@ def worker_process(worker_id, range_start, range_end, index_name, counter):
             if failed <= 3:
                 logger.warning(f"Worker {worker_id} erro: {result}")
 
+    producer.join()
     conn.close()
     logger.info(f"Worker {worker_id}: {success:,} OK, {failed:,} erros")
+
+    if failed:
+        # Perda definitiva após retries — o processo pai aborta o swap do alias.
+        sys.exit(1)
 
 
 def compute_ranges(num_workers):
@@ -327,6 +370,7 @@ def create_index(es, index_name=INDEX_NAME):
             "number_of_shards": 3,
             "number_of_replicas": 0,
             "refresh_interval": "-1",
+            "index.codec": "best_compression",
             "index.translog.durability": "async",
             "index.translog.flush_threshold_size": "1gb",
             "analysis": {
@@ -475,9 +519,13 @@ def vacuum_analyze(database_url):
 
 
 def main():
+    if not ES_PASS:
+        logger.error("ES_PASS não definido — exporte a senha do Elasticsearch antes de rodar")
+        sys.exit(1)
+
     logger.info("=" * 60)
     logger.info("Sync PostgreSQL → Elasticsearch")
-    logger.info(f"Workers: {NUM_WORKERS}, Batch PG: {BATCH_SIZE}, Chunk ES: {ES_CHUNK}, Threads/worker: {BULK_THREADS}")
+    logger.info(f"Workers: {NUM_WORKERS}, Batch PG: {BATCH_SIZE}, Chunk ES: {ES_CHUNK}, Prefetch: {PREFETCH_BATCHES}")
     logger.info("=" * 60)
 
     es = Elasticsearch(ES_HOST, basic_auth=(ES_USER, ES_PASS), verify_certs=False)
@@ -541,10 +589,15 @@ def main():
     elapsed = datetime.now() - start
     logger.info(f"Workers concluídos em {elapsed}")
 
-    # 7. Verificar se algum worker falhou
-    for p in workers:
-        if p.exitcode != 0:
+    # 7. Worker com falha (crash ou docs perdidos após retries) → abortar SEM swap.
+    #    O alias continua no índice antigo; só o índice parcial novo é descartado.
+    failed_workers = [p for p in workers if p.exitcode != 0]
+    if failed_workers:
+        for p in failed_workers:
             logger.error(f"Worker PID {p.pid} saiu com código {p.exitcode}")
+        logger.error("Abortando: alias preservado no índice atual, removendo índice parcial")
+        es.indices.delete(index=new_index)
+        sys.exit(1)
 
     # 8. Finalizar índice (refresh + settings de produção)
     es.indices.refresh(index=new_index)
@@ -556,11 +609,22 @@ def main():
     stats = es.indices.stats(index=new_index)['indices'][new_index]['primaries']
     doc_count = stats['docs']['count']
 
-    # 9. Validar antes do swap
-    if doc_count < 1000:
-        logger.error(f"Apenas {doc_count} docs indexados — abortando swap (mínimo 1000)")
+    # 9. Validar contra o total real ANTES do swap (protege contra perda silenciosa)
+    min_expected = int(total * MIN_DOC_RATIO)
+    if doc_count < min_expected:
+        logger.error(
+            f"Docs indexados ({doc_count:,}) abaixo do mínimo esperado "
+            f"({min_expected:,} = {MIN_DOC_RATIO:.1%} de {total:,}) — abortando swap"
+        )
         es.indices.delete(index=new_index)
         sys.exit(1)
+
+    # 9b. force_merge: índice fica estático por 1 mês — menos segmentos = busca
+    #     mais rápida e menos heap. Roda antes do swap (alias antigo ainda serve).
+    logger.info("force_merge (max_num_segments=1) — pode levar dezenas de minutos...")
+    merge_start = datetime.now()
+    es.options(request_timeout=7200).indices.forcemerge(index=new_index, max_num_segments=1)
+    logger.info(f"force_merge concluído em {datetime.now() - merge_start}")
 
     # 10. Alias swap atômico
     old_indices = []
