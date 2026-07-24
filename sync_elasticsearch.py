@@ -29,9 +29,15 @@ from threading import Thread
 
 import psycopg2
 from psycopg2.extras import NamedTupleCursor
+from dotenv import load_dotenv
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import streaming_bulk
 import urllib3
+
+# O sync roda como script solto (não importa config.py), mas depende das mesmas
+# variáveis do .env que o main.py: credenciais do ES — obrigatórias, sem default
+# — e PGOPTIONS, que isenta a sessão de ETL do statement_timeout do papel.
+load_dotenv()
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
