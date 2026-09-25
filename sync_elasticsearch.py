@@ -14,7 +14,7 @@ Otimizações aplicadas:
 
 Robustez:
 - Worker sai com exit code 1 se qualquer doc falhar após retries
-- Swap do alias abortado se um worker falhar ou docs < 99,5% do esperado
+- Swap do alias abortado se um worker falhar ou empresas (_count) < 99,5% do esperado
 """
 
 import logging
@@ -613,13 +613,15 @@ def main():
     })
 
     stats = es.indices.stats(index=new_index)['indices'][new_index]['primaries']
-    doc_count = stats['docs']['count']
+    # _count conta só docs de topo (empresas). _stats.docs.count inclui os sócios nested e
+    # inflaria a contagem em ~50%, mascarando empresas ausentes na guarda abaixo.
+    doc_count = es.count(index=new_index)['count']
 
     # 9. Validar contra o total real ANTES do swap (protege contra perda silenciosa)
     min_expected = int(total * MIN_DOC_RATIO)
     if doc_count < min_expected:
         logger.error(
-            f"Docs indexados ({doc_count:,}) abaixo do mínimo esperado "
+            f"Empresas indexadas ({doc_count:,}) abaixo do mínimo esperado "
             f"({min_expected:,} = {MIN_DOC_RATIO:.1%} de {total:,}) — abortando swap"
         )
         es.indices.delete(index=new_index)
@@ -662,10 +664,10 @@ def main():
 
     logger.info("=" * 60)
     logger.info("CONCLUÍDO")
-    logger.info(f"Docs: {doc_count:,}")
+    logger.info(f"Empresas: {doc_count:,} (docs Lucene com sócios: {stats['docs']['count']:,})")
     logger.info(f"Size: {stats['store']['size_in_bytes']/1024/1024/1024:.2f} GB")
     logger.info(f"Time: {elapsed}")
-    logger.info(f"Speed: {doc_count/elapsed.total_seconds():.0f} docs/s")
+    logger.info(f"Speed: {doc_count/elapsed.total_seconds():.0f} empresas/s")
     logger.info("=" * 60)
 
 
