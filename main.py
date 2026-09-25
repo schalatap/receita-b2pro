@@ -397,6 +397,8 @@ def main():
             if saved_indexes:
                 logger.info("Recreating indexes (pode demorar)...")
                 db.create_all_indexes_after_bulk_load(saved_indexes)
+                logger.info("Ordenando fisicamente por CNPJ para o sync ES (CLUSTER)...")
+                db.cluster_for_sync()
             from fix_cnae_descriptions import apply as fix_cnae_descriptions
 
             logger.info("Applying IBGE CNAE descriptions...")

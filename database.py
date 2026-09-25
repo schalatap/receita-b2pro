@@ -336,6 +336,43 @@ class Database:
         else:
             logger.warning(f"{remaining} índice(s)/PK ainda pendente(s) — mantidos para o próximo run")
 
+    # Tabela → índice que dá a ordem de leitura do sync ES (por cnpj_basico). A carga paralela
+    # grava as linhas na ordem dos ZIPs (correlação física ~0,05), e o sync lê por faixa de CNPJ:
+    # cada lote de 20 mil virava milhares de leituras aleatórias no heap. Medido no dev (07/2026):
+    # blocos lidos do disco por lote caem 63-87% (empresas) e 49-82% (sócios).
+    _PHYSICAL_ORDER = {
+        "estabelecimentos": "estabelecimentos_pkey",
+        "socios": "idx_socios_lookup",
+    }
+
+    def cluster_for_sync(self):
+        """Reordena fisicamente as tabelas lidas por faixa de CNPJ no sync ES (CLUSTER).
+
+        CLUSTER é atômico (se cair, a tabela antiga fica intacta) e preserva defaults,
+        constraints e índices. A ordem não se mantém sozinha, mas a carga mensal é
+        TRUNCATE + reload, então roda uma vez por lote, depois da recriação dos índices.
+        """
+        self.connect()
+        with self.conn.cursor() as cur:
+            cur.execute("SET maintenance_work_mem = '1GB'")
+        for table, index in self._PHYSICAL_ORDER.items():
+            start = time.monotonic()
+            try:
+                with self.conn.cursor() as cur:
+                    cur.execute("SELECT to_regclass(%s)", (index,))
+                    if cur.fetchone()[0] is None:
+                        logger.warning(f"  {table}: índice {index} ausente — ordenação física pulada")
+                        continue
+                    cur.execute(f"CLUSTER {table} USING {index}")
+                    cur.execute(f"ANALYZE {table}")
+                self.conn.commit()
+            except psycopg2.Error as e:
+                # Otimização de leitura, não de dados: a carga já está completa e íntegra.
+                self.conn.rollback()
+                logger.warning(f"  {table}: ordenação física falhou, sync fica mais lento: {e}")
+                continue
+            logger.info(f"  {table} ordenada por {index} em {time.monotonic() - start:.0f} s")
+
     def verify_schema(self, expected: Dict[str, List[str]]) -> List[str]:
         """Pré-voo: confere se as tabelas de destino aceitam o que a carga escreve.
 
