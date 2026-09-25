@@ -176,8 +176,10 @@ SELECT s.cnpj_basico, s.nome_socio, s.identificador_de_socio,
 FROM socios s
 LEFT JOIN qualificacoes_socios qs ON s.qualificacao_do_socio = qs.codigo
 WHERE s.cnpj_basico = ANY(%s)
-ORDER BY s.cnpj_basico, s.data_entrada_sociedade DESC
+ORDER BY s.cnpj_basico, s.data_entrada_sociedade DESC, s.socio_id
 """
+# socio_id desempata sócios com a mesma data de entrada: fetch_socios guarda só os 10 primeiros,
+# e sem desempate o 10º mudava conforme a ordem física da tabela (o CLUSTER expôs isso).
 
 
 def fetch_socios(conn, cnpjs):
