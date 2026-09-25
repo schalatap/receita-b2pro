@@ -3,7 +3,7 @@
 Sync PostgreSQL → Elasticsearch.
 
 Otimizações aplicadas:
-- Keyset pagination (sem OFFSET lento)
+- Keyset pagination (sem OFFSET lento); o lote é montado antes dos enriquecimentos
 - Sócios em batch com ANY()
 - Multiprocessing: N workers dividem o keyspace do CNPJ
 - Producer/consumer por worker: thread produtora busca no PG enquanto a
@@ -24,7 +24,7 @@ import sys
 import time
 from datetime import datetime
 from collections import defaultdict
-from multiprocessing import Process, Value
+from multiprocessing import Process, SimpleQueue, Value
 from threading import Thread
 
 import psycopg2
@@ -52,6 +52,10 @@ ES_PASS = os.getenv('ES_PASS', '')  # obrigatório — sem default por seguranç
 INDEX_NAME = 'empresas_b2b'
 
 NUM_WORKERS = int(os.getenv('SYNC_WORKERS', '4'))
+# Faixas pequenas numa fila comum: quem termina a sua pega a próxima. Com 4 faixas fixas, o custo
+# desigual do keyspace deixava workers ociosos por mais de uma hora (25/09: 76 a 155 min).
+NUM_FAIXAS = int(os.getenv('SYNC_FAIXAS', '64'))
+LOTE_LENTO_S = 30  # lote de empresas acima disto é logado com o cursor, para achar o plano ruim
 BATCH_SIZE = 20000
 ES_CHUNK = 3000
 PREFETCH_BATCHES = 2   # batches PG enfileirados à frente do envio ao ES
@@ -79,37 +83,55 @@ def fmt_date(d):
 
 
 QUERY_EMPRESAS = """
+WITH pagina AS MATERIALIZED (
+    SELECT
+        e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv, e.nome_fantasia, e.situacao_cadastral,
+        e.data_situacao_cadastral, e.data_inicio_atividade, e.cnae_fiscal_principal,
+        e.cnae_fiscal_secundaria, e.tipo_logradouro, e.logradouro, e.numero, e.complemento,
+        e.bairro, e.cep, e.municipio, e.uf, e.ddd_1, e.telefone_1, e.ddd_2, e.telefone_2,
+        e.correio_eletronico, e.identificador_matriz_filial,
+        emp.razao_social, emp.natureza_juridica, emp.porte, emp.capital_social
+    FROM estabelecimentos e
+    JOIN empresas emp ON e.cnpj_basico = emp.cnpj_basico
+    WHERE (e.situacao_cadastral IN ('02', '03', '04')
+       OR (e.situacao_cadastral = '08'
+           AND e.data_situacao_cadastral >= CURRENT_DATE - INTERVAL '2 years'))
+      AND e.cnpj_basico >= %(inicio)s AND e.cnpj_basico < %(teto)s
+      AND (e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv) > (%(last_basico)s, %(last_ordem)s, %(last_dv)s)
+    ORDER BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv
+    LIMIT %(limite)s
+)
 SELECT
-    e.cnpj_basico || e.cnpj_ordem || e.cnpj_dv as cnpj,
-    e.cnpj_basico,
-    emp.razao_social,
-    e.nome_fantasia,
-    e.situacao_cadastral,
-    e.data_situacao_cadastral,
-    e.data_inicio_atividade,
-    e.cnae_fiscal_principal,
+    p.cnpj_basico || p.cnpj_ordem || p.cnpj_dv as cnpj,
+    p.cnpj_basico,
+    p.razao_social,
+    p.nome_fantasia,
+    p.situacao_cadastral,
+    p.data_situacao_cadastral,
+    p.data_inicio_atividade,
+    p.cnae_fiscal_principal,
     c.descricao as cnae_descricao,
-    LEFT(e.cnae_fiscal_principal, 2) as cnae_divisao,
-    e.cnae_fiscal_secundaria,
-    emp.natureza_juridica,
+    LEFT(p.cnae_fiscal_principal, 2) as cnae_divisao,
+    p.cnae_fiscal_secundaria,
+    p.natureza_juridica,
     nj.descricao as natureza_descricao,
-    emp.porte,
-    emp.capital_social,
-    e.tipo_logradouro,
-    e.logradouro,
-    e.numero,
-    e.complemento,
-    e.bairro,
-    e.cep,
-    e.municipio,
+    p.porte,
+    p.capital_social,
+    p.tipo_logradouro,
+    p.logradouro,
+    p.numero,
+    p.complemento,
+    p.bairro,
+    p.cep,
+    p.municipio,
     COALESCE(ibge.nome, m.descricao) as municipio_nome,
-    e.uf,
-    CASE WHEN e.ddd_1 IS NOT NULL AND e.telefone_1 IS NOT NULL
-         THEN e.ddd_1 || e.telefone_1 END as telefone_1,
-    CASE WHEN e.ddd_2 IS NOT NULL AND e.telefone_2 IS NOT NULL
-         THEN e.ddd_2 || e.telefone_2 END as telefone_2,
-    e.correio_eletronico as email,
-    e.identificador_matriz_filial,
+    p.uf,
+    CASE WHEN p.ddd_1 IS NOT NULL AND p.telefone_1 IS NOT NULL
+         THEN p.ddd_1 || p.telefone_1 END as telefone_1,
+    CASE WHEN p.ddd_2 IS NOT NULL AND p.telefone_2 IS NOT NULL
+         THEN p.ddd_2 || p.telefone_2 END as telefone_2,
+    p.correio_eletronico as email,
+    p.identificador_matriz_filial,
     ds.opcao_pelo_simples,
     ds.opcao_pelo_mei,
     ds.data_opcao_pelo_simples,
@@ -131,23 +153,22 @@ SELECT
     cvm_ind.setor_atividade as cvm_setor,
     cvm_ind.receita_liquida as cvm_receita,
     cvm_ind.lucro_liquido as cvm_lucro
-FROM estabelecimentos e
-JOIN empresas emp ON e.cnpj_basico = emp.cnpj_basico
-LEFT JOIN cnaes c ON e.cnae_fiscal_principal = c.codigo
-LEFT JOIN naturezas_juridicas nj ON emp.natureza_juridica = nj.codigo
-LEFT JOIN municipios m ON e.municipio = m.codigo
+FROM pagina p
+LEFT JOIN cnaes c ON p.cnae_fiscal_principal = c.codigo
+LEFT JOIN naturezas_juridicas nj ON p.natureza_juridica = nj.codigo
+LEFT JOIN municipios m ON p.municipio = m.codigo
 LEFT JOIN enrich.ibge_municipios ibge ON ibge.codigo_ibge = m.codigo_ibge
-LEFT JOIN dados_simples ds ON e.cnpj_basico = ds.cnpj_basico
-LEFT JOIN enrich.pgfn_empresas_mat pgfn ON pgfn.cnpj_basico = e.cnpj_basico
-LEFT JOIN enrich.cvm_lookup cvm_ind ON cvm_ind.cnpj_basico = e.cnpj_basico
-WHERE (e.situacao_cadastral IN ('02', '03', '04')
-   OR (e.situacao_cadastral = '08'
-       AND e.data_situacao_cadastral >= CURRENT_DATE - INTERVAL '2 years'))
-  AND e.cnpj_basico >= %s AND e.cnpj_basico < %s
-  AND (e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv) > (%s, %s, %s)
-ORDER BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv
-LIMIT %s
+LEFT JOIN dados_simples ds ON ds.cnpj_basico = p.cnpj_basico
+LEFT JOIN enrich.pgfn_empresas_mat pgfn ON pgfn.cnpj_basico = p.cnpj_basico
+LEFT JOIN enrich.cvm_lookup cvm_ind ON cvm_ind.cnpj_basico = p.cnpj_basico
+ORDER BY p.cnpj_basico, p.cnpj_ordem, p.cnpj_dv
 """
+# O lote (estabelecimentos + empresa, com LIMIT) é montado ANTES dos enriquecimentos. Com os
+# LEFT JOINs no mesmo nível do LIMIT, o planner ou fazia Merge Join lendo dados_simples desde o
+# primeiro CNPJ a cada lote (~10 s/lote) ou, com a faixa repetida nos JOINs, subestimava o lote
+# e escolhia hash/sort sobre o resto da faixa (lotes de minutos no worker 3, sync de 25/09).
+# Os enriquecimentos são 1:1 por cnpj_basico/código, então aplicar o LIMIT antes não muda o
+# resultado; o JOIN com empresas fica dentro do lote porque ele exclui linhas (INNER).
 
 QUERY_SOCIOS = """
 SELECT s.cnpj_basico, s.nome_socio, s.identificador_de_socio,
@@ -254,72 +275,108 @@ def transform(row, socios, index_name):
     }
 
 
-def batch_producer(conn, range_start, range_end, out_queue):
-    """Thread produtora: busca batches no PG (empresas + sócios) e enfileira.
+def produce_range(conn, range_start, range_end, out_queue, tempos):
+    """Busca uma faixa em batches no PG (empresas + sócios) e enfileira cada batch."""
+    last_basico, last_ordem, last_dv = '', '', ''
+    while True:
+        params = {
+            'inicio': range_start, 'teto': range_end,
+            'last_basico': last_basico, 'last_ordem': last_ordem, 'last_dv': last_dv,
+            'limite': BATCH_SIZE,
+        }
+        t0 = time.monotonic()
+        with conn.cursor(cursor_factory=NamedTupleCursor) as cur:
+            cur.execute(QUERY_EMPRESAS, params)
+            rows = cur.fetchall()
+        duracao = time.monotonic() - t0
+        tempos['pg_empresas'] += duracao
+        if duracao > LOTE_LENTO_S:
+            logger.warning(
+                f"Lote lento: {duracao:.0f} s, faixa [{range_start}, {range_end}), "
+                f"cursor ({last_basico}, {last_ordem}, {last_dv})"
+            )
+
+        if not rows:
+            return
+
+        t0 = time.monotonic()
+        cnpjs_basicos = list({r.cnpj_basico for r in rows})
+        socios_map = fetch_socios(conn, cnpjs_basicos)
+        tempos['pg_socios'] += time.monotonic() - t0
+
+        t0 = time.monotonic()
+        out_queue.put((rows, socios_map))
+        tempos['fila_cheia'] += time.monotonic() - t0
+
+        last_row = rows[-1]
+        last_basico = last_row.cnpj_basico
+        last_ordem = last_row.cnpj[8:12]
+        last_dv = last_row.cnpj[12:14]
+
+
+def batch_producer(conn, faixas, out_queue, tempos):
+    """Thread produtora: consome faixas da fila comum até a sentinela e enfileira os batches.
 
     Todo acesso psycopg2 acontece aqui — a conexão nunca cruza threads.
-    Sentinela: None = fim da faixa; Exception = falha a propagar no consumidor.
+    Sentinela: None = fim do trabalho; Exception = falha a propagar no consumidor.
     """
-    last_basico, last_ordem, last_dv = '', '', ''
     try:
-        while True:
-            with conn.cursor(cursor_factory=NamedTupleCursor) as cur:
-                cur.execute(QUERY_EMPRESAS, (range_start, range_end, last_basico, last_ordem, last_dv, BATCH_SIZE))
-                rows = cur.fetchall()
-
-            if not rows:
-                out_queue.put(None)
-                return
-
-            cnpjs_basicos = list({r.cnpj_basico for r in rows})
-            socios_map = fetch_socios(conn, cnpjs_basicos)
-            out_queue.put((rows, socios_map))
-
-            last_row = rows[-1]
-            last_basico = last_row.cnpj_basico
-            last_ordem = last_row.cnpj[8:12]
-            last_dv = last_row.cnpj[12:14]
+        for range_start, range_end in iter(faixas.get, None):
+            produce_range(conn, range_start, range_end, out_queue, tempos)
+            tempos['faixas'] += 1
+        out_queue.put(None)
     except Exception as exc:
         out_queue.put(exc)
 
 
-def generate_docs(batch_queue, index_name, counter):
+def generate_docs(batch_queue, index_name, counter, tempos):
     """Consome batches da fila e gera documentos ES (prefetch: PG e ES sobrepostos)."""
     while True:
+        t0 = time.monotonic()
         item = batch_queue.get()
+        tempos['espera_pg'] += time.monotonic() - t0
         if item is None:
             return
         if isinstance(item, Exception):
             raise item
 
         rows, socios_map = item
-        for row in rows:
-            socios = socios_map.get(row.cnpj_basico, [])
-            yield transform(row, socios, index_name)
+        t0 = time.monotonic()
+        docs = [transform(row, socios_map.get(row.cnpj_basico, []), index_name) for row in rows]
+        tempos['transformacao'] += time.monotonic() - t0
+        yield from docs
 
         with counter.get_lock():
             counter.value += len(rows)
 
 
-def worker_process(worker_id, range_start, range_end, index_name, counter):
-    """Worker: indexa uma faixa do keyspace CNPJ. Sai com código 1 se perder docs."""
-    logger.info(f"Worker {worker_id}: cnpj_basico [{range_start}, {range_end})")
+def worker_process(worker_id, faixas, index_name, counter):
+    """Worker: indexa faixas da fila comum até esvaziá-la. Sai com código 1 se perder docs."""
 
     conn = psycopg2.connect(DATABASE_URL)
     conn.set_session(readonly=True)
     es = Elasticsearch(ES_HOST, basic_auth=(ES_USER, ES_PASS), verify_certs=False)
 
+    # Produtora (PG) e consumidora (transformação + envio ao ES) rodam sobrepostas:
+    # - pg_empresas/pg_socios: tempo da produtora no PG; fila_cheia: produtora parada porque a
+    #   consumidora está atrás (alto = o lado do ES limita).
+    # - espera_pg: consumidora parada sem batch (alto = o PG limita); transformacao: montar docs;
+    #   envio_es (derivado): o resto da consumidora — serialização, bulk HTTP e resposta do ES.
+    tempos = {'faixas': 0, 'pg_empresas': 0.0, 'pg_socios': 0.0, 'fila_cheia': 0.0,
+              'espera_pg': 0.0, 'transformacao': 0.0}
+    inicio = time.monotonic()
+
     batch_queue = queue.Queue(maxsize=PREFETCH_BATCHES)
     producer = Thread(
         target=batch_producer,
-        args=(conn, range_start, range_end, batch_queue),
+        args=(conn, faixas, batch_queue, tempos),
         daemon=True,
     )
     producer.start()
 
     success, failed = 0, 0
     for ok, result in streaming_bulk(
-        es, generate_docs(batch_queue, index_name, counter),
+        es, generate_docs(batch_queue, index_name, counter, tempos),
         chunk_size=ES_CHUNK,
         max_retries=8,
         initial_backoff=2,
@@ -337,18 +394,23 @@ def worker_process(worker_id, range_start, range_end, index_name, counter):
     producer.join()
     conn.close()
     logger.info(f"Worker {worker_id}: {success:,} OK, {failed:,} erros")
+    total = time.monotonic() - inicio
+    envio_es = total - tempos['espera_pg'] - tempos['transformacao']
+    logger.info(
+        f"Worker {worker_id} tempos (s): total {total:.0f} · envio_es {envio_es:.0f} · "
+        + " · ".join(f"{nome} {valor:.0f}" for nome, valor in tempos.items())
+    )
 
     if failed:
         # Perda definitiva após retries — o processo pai aborta o swap do alias.
         sys.exit(1)
 
 
-def compute_ranges(num_workers):
-    """Divide o keyspace por percentis reais do banco (distribuição balanceada)."""
+def compute_ranges(num_ranges):
+    """Divide o keyspace em faixas de tamanho igual pelos percentis reais do banco."""
     conn = psycopg2.connect(DATABASE_URL)
     with conn.cursor() as cur:
-        # Gerar percentis: para 4 workers, precisamos de p25, p50, p75
-        fractions = [i / num_workers for i in range(1, num_workers)]
+        fractions = [i / num_ranges for i in range(1, num_ranges)]
         percentiles = ', '.join(str(f) for f in fractions)
         cur.execute(f"""
             SELECT percentile_disc(ARRAY[{percentiles}]) WITHIN GROUP (ORDER BY cnpj_basico)
@@ -366,7 +428,7 @@ def compute_ranges(num_workers):
     for s, e in zip(starts, ends):
         ranges.append((s, e))
 
-    logger.info(f"Ranges: {ranges}")
+    logger.info(f"{len(ranges)} faixas: {ranges[0]} … {ranges[-1]}")
     return ranges
 
 
@@ -531,7 +593,10 @@ def main():
 
     logger.info("=" * 60)
     logger.info("Sync PostgreSQL → Elasticsearch")
-    logger.info(f"Workers: {NUM_WORKERS}, Batch PG: {BATCH_SIZE}, Chunk ES: {ES_CHUNK}, Prefetch: {PREFETCH_BATCHES}")
+    logger.info(
+        f"Workers: {NUM_WORKERS}, Faixas: {NUM_FAIXAS}, Batch PG: {BATCH_SIZE}, "
+        f"Chunk ES: {ES_CHUNK}, Prefetch: {PREFETCH_BATCHES}"
+    )
     logger.info("=" * 60)
 
     es = Elasticsearch(ES_HOST, basic_auth=(ES_USER, ES_PASS), verify_certs=False)
@@ -567,16 +632,23 @@ def main():
     create_index(es, new_index)
     logger.info(f"Índice temporário: {new_index}")
 
-    # 5. Dividir keyspace e spawnar workers
-    ranges = compute_ranges(NUM_WORKERS)
+    # 5. Dividir o keyspace em faixas pequenas numa fila comum e spawnar os workers
+    ranges = compute_ranges(NUM_FAIXAS)
+    faixas = SimpleQueue()
     counter = Value('i', 0)
     start = datetime.now()
 
+    # Workers sobem ANTES de a fila ser alimentada: put() escreve num pipe de capacidade finita
+    # e, sem consumidores, bloquearia o pai com muitas faixas (reproduzido com 2.048).
     workers = []
-    for i, (range_start, range_end) in enumerate(ranges):
-        p = Process(target=worker_process, args=(i, range_start, range_end, new_index, counter))
+    for i in range(NUM_WORKERS):
+        p = Process(target=worker_process, args=(i, faixas, new_index, counter))
         p.start()
         workers.append(p)
+    for faixa in ranges:
+        faixas.put(faixa)
+    for _ in range(NUM_WORKERS):
+        faixas.put(None)  # uma sentinela por worker
     logger.info(f"{NUM_WORKERS} workers iniciados")
 
     # 6. Monitorar progresso
