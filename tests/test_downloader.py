@@ -306,6 +306,29 @@ class TestDownloadAndExtract:
             assert "ESTABELE.D51213" in names
             assert "README.txt" not in names
 
+    @pytest.mark.parametrize(
+        ("files", "error"),
+        [
+            ({"README.txt": "sem CSV da RFB"}, "No recognized source files"),
+            ({"../ESTABELE.D51213": "fora de temp/"}, "Unsafe archive member"),
+        ],
+    )
+    def test_rejects_empty_or_unsafe_archive(self, downloader, tmp_path, files, error):
+        """ZIP sem CSV reconhecido ou com caminho para fora de temp/ vira erro, sem extrair nada."""
+        zip_content = _create_test_zip(tmp_path, files)
+
+        with patch("requests.get") as mock_get:
+            mock_response = MagicMock()
+            mock_response.headers = {"content-length": str(len(zip_content))}
+            mock_response.iter_content = MagicMock(return_value=[zip_content])
+            mock_response.raise_for_status = MagicMock()
+            mock_get.return_value = mock_response
+
+            with pytest.raises(ValueError, match=error):
+                downloader._download_and_extract("2024-03", "Test.zip")
+
+        assert not (tmp_path.parent / "ESTABELE.D51213").exists()
+
     def test_download_stream_uses_stall_timeout(self, downloader, config, tmp_path):
         """Streaming data requests should use stall_timeout as the read timeout."""
         config.stall_timeout = 7

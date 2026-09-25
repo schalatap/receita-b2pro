@@ -320,15 +320,22 @@ class Downloader:
         extracted_files = []
         try:
             with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                for member in zip_ref.namelist():
+                for info in zip_ref.infolist():
+                    if info.is_dir():
+                        continue
+                    member = info.filename
                     member_upper = member.upper()
                     is_cnpj_file = any(pattern in member_upper for pattern in CNPJ_FILE_PATTERNS)
 
                     if is_cnpj_file:
-                        extract_path = self.temp_path / member
+                        extract_path = self._safe_extract_path(member)
                         zip_ref.extract(member, self.temp_path)
                         extracted_files.append(extract_path)
                         logger.debug(f"Extracted: {member}")
+
+            # ZIP sem CSV reconhecido carregaria a tabela vazia em silêncio (upstream bb3a515).
+            if not extracted_files:
+                raise ValueError(f"No recognized source files in {directory}/{filename}")
 
         finally:
             # Cleanup ZIP file unless keeping files
@@ -336,6 +343,18 @@ class Downloader:
                 zip_path.unlink()
 
         return extracted_files
+
+    def _safe_extract_path(self, member: str) -> Path:
+        """Recusa membros do ZIP que gravariam fora de temp/ (upstream ea8e8f9)."""
+        member_path = Path(member)
+        extract_path = self.temp_path / member_path
+        if (
+            member_path.is_absolute()
+            or ".." in member_path.parts
+            or not extract_path.resolve().is_relative_to(self.temp_path.resolve())
+        ):
+            raise ValueError(f"Unsafe archive member: {member}")
+        return extract_path
 
     @staticmethod
     def _directory_slug(directory: str) -> str:
