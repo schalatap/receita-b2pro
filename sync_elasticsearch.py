@@ -147,6 +147,10 @@ SELECT
     -- PGFN (Dívida Ativa)
     pgfn.divida_total as pgfn_divida_total,
     pgfn.qtd_inscricoes as pgfn_qtd_inscricoes,
+    pgfn.cobranca_total as pgfn_cobranca_total,
+    pgfn.cobranca_qtd as pgfn_cobranca_qtd,
+    pgfn.suspensa_total as pgfn_suspensa_total,
+    pgfn.suspensa_qtd as pgfn_suspensa_qtd,
     pgfn.qtd_ajuizadas as pgfn_qtd_ajuizadas,
     -- CVM (Capital Aberto)
     cvm_ind.cnpj_basico IS NOT NULL as cvm_capital_aberto,
@@ -201,7 +205,7 @@ def fetch_socios(conn, cnpjs):
     return dict(result)
 
 
-def transform(row, socios, index_name):
+def transform(row, socios, index_name, pgfn_referencia):
     capital = float(row.capital_social) if row.capital_social else 0
 
     location = None
@@ -265,10 +269,17 @@ def transform(row, socios, index_name):
             'municipio_microrregiao': row.municipio_microrregiao,
             'municipio_capital': row.municipio_capital or False,
             'location': location,
-            'tem_divida_ativa': bool(row.pgfn_divida_total and float(row.pgfn_divida_total) > 0),
-            'divida_total': float(row.pgfn_divida_total) if row.pgfn_divida_total else None,
+            # Sem linha na materializada, a empresa não deve nada como devedora principal.
+            'tem_divida_ativa': bool(row.pgfn_qtd_inscricoes),
+            'tem_divida_em_cobranca': bool(row.pgfn_cobranca_qtd),
+            'divida_total': float(row.pgfn_divida_total or 0),
             'qtd_inscricoes_pgfn': row.pgfn_qtd_inscricoes or 0,
+            'pgfn_cobranca_total': float(row.pgfn_cobranca_total or 0),
+            'pgfn_cobranca_qtd': row.pgfn_cobranca_qtd or 0,
+            'pgfn_suspensa_total': float(row.pgfn_suspensa_total or 0),
+            'pgfn_suspensa_qtd': row.pgfn_suspensa_qtd or 0,
             'qtd_ajuizadas_pgfn': row.pgfn_qtd_ajuizadas or 0,
+            'pgfn_referencia': pgfn_referencia,
             'empresa_capital_aberto': bool(row.cvm_capital_aberto),
             'setor_cvm': row.cvm_setor,
             'receita_liquida': float(row.cvm_receita) if row.cvm_receita else None,
@@ -331,7 +342,7 @@ def batch_producer(conn, faixas, out_queue, tempos):
         out_queue.put(exc)
 
 
-def generate_docs(batch_queue, index_name, counter, tempos):
+def generate_docs(batch_queue, index_name, pgfn_referencia, counter, tempos):
     """Consome batches da fila e gera documentos ES (prefetch: PG e ES sobrepostos)."""
     while True:
         t0 = time.monotonic()
@@ -344,7 +355,10 @@ def generate_docs(batch_queue, index_name, counter, tempos):
 
         rows, socios_map = item
         t0 = time.monotonic()
-        docs = [transform(row, socios_map.get(row.cnpj_basico, []), index_name) for row in rows]
+        docs = [
+            transform(row, socios_map.get(row.cnpj_basico, []), index_name, pgfn_referencia)
+            for row in rows
+        ]
         tempos['transformacao'] += time.monotonic() - t0
         yield from docs
 
@@ -352,7 +366,7 @@ def generate_docs(batch_queue, index_name, counter, tempos):
             counter.value += len(rows)
 
 
-def worker_process(worker_id, faixas, index_name, counter):
+def worker_process(worker_id, faixas, index_name, pgfn_referencia, counter):
     """Worker: indexa faixas da fila comum até esvaziá-la. Sai com código 1 se perder docs."""
 
     conn = psycopg2.connect(DATABASE_URL)
@@ -378,7 +392,7 @@ def worker_process(worker_id, faixas, index_name, counter):
 
     success, failed = 0, 0
     for ok, result in streaming_bulk(
-        es, generate_docs(batch_queue, index_name, counter, tempos),
+        es, generate_docs(batch_queue, index_name, pgfn_referencia, counter, tempos),
         chunk_size=ES_CHUNK,
         max_retries=8,
         initial_backoff=2,
@@ -524,9 +538,15 @@ def create_index(es, index_name=INDEX_NAME):
                 "municipio_capital": {"type": "boolean"},
                 "location": {"type": "geo_point"},
                 "tem_divida_ativa": {"type": "boolean"},
+                "tem_divida_em_cobranca": {"type": "boolean"},
                 "divida_total": {"type": "double"},
                 "qtd_inscricoes_pgfn": {"type": "integer"},
+                "pgfn_cobranca_total": {"type": "double"},
+                "pgfn_cobranca_qtd": {"type": "integer"},
+                "pgfn_suspensa_total": {"type": "double"},
+                "pgfn_suspensa_qtd": {"type": "integer"},
                 "qtd_ajuizadas_pgfn": {"type": "integer"},
+                "pgfn_referencia": {"type": "keyword"},
                 "empresa_capital_aberto": {"type": "boolean"},
                 "setor_cvm": {"type": "keyword"},
                 "receita_liquida": {"type": "double"},
@@ -542,17 +562,29 @@ ALIAS_NAME = INDEX_NAME
 
 
 def prepare_enrich_tables(conn):
-    """Popula tabelas materializadas de enriquecimento usadas nos JOINs do sync."""
+    """Popula tabelas materializadas de enriquecimento usadas nos JOINs do sync.
+
+    Devolve a referência (AAAA-MM) da base PGFN materializada, gravada em cada documento.
+    """
     logger.info("Populando tabelas de enriquecimento...")
     with conn.cursor() as cur:
-        cur.execute("TRUNCATE TABLE enrich.pgfn_empresas_mat")
-        cur.execute("""
-            INSERT INTO enrich.pgfn_empresas_mat
-            SELECT * FROM enrich.pgfn_empresas
-        """)
+        cur.execute("SELECT to_regclass('enrich.pgfn_carga')")
+        referencia = None
+        if cur.fetchone()[0] is not None:
+            cur.execute("SELECT referencia FROM enrich.pgfn_carga")
+            linha = cur.fetchone()
+            referencia = linha[0] if linha else None
+        if referencia is None:
+            raise RuntimeError("enrich.pgfn_carga sem referência: rode load_pgfn.py antes do sync")
+
+        # A view (load_pgfn.py) define as colunas; recriar evita manter uma segunda DDL.
+        cur.execute("DROP TABLE IF EXISTS enrich.pgfn_empresas_mat")
+        cur.execute("CREATE UNLOGGED TABLE enrich.pgfn_empresas_mat AS SELECT * FROM enrich.pgfn_empresas")
         pgfn_count = cur.rowcount
+        cur.execute("CREATE INDEX ix_pgfn_mat_cnpj_basico ON enrich.pgfn_empresas_mat (cnpj_basico)")
+        cur.execute("ANALYZE enrich.pgfn_empresas_mat")
         conn.commit()
-        logger.info(f"  pgfn_empresas_mat: {pgfn_count:,} rows")
+        logger.info(f"  pgfn_empresas_mat: {pgfn_count:,} rows (base PGFN de {referencia})")
 
         cur.execute("TRUNCATE TABLE enrich.cvm_lookup")
         cur.execute("""
@@ -572,6 +604,8 @@ def prepare_enrich_tables(conn):
         cvm_count = cur.rowcount
         conn.commit()
         logger.info(f"  cvm_lookup: {cvm_count:,} rows")
+
+    return referencia
 
 
 def vacuum_analyze(database_url):
@@ -609,7 +643,7 @@ def main():
 
     # 1. Preparar tabelas de enriquecimento
     prep_conn = psycopg2.connect(DATABASE_URL)
-    prepare_enrich_tables(prep_conn)
+    pgfn_referencia = prepare_enrich_tables(prep_conn)
     prep_conn.close()
 
     # 2. VACUUM ANALYZE para estatísticas atualizadas
@@ -644,7 +678,7 @@ def main():
     # e, sem consumidores, bloquearia o pai com muitas faixas (reproduzido com 2.048).
     workers = []
     for i in range(NUM_WORKERS):
-        p = Process(target=worker_process, args=(i, faixas, new_index, counter))
+        p = Process(target=worker_process, args=(i, faixas, new_index, pgfn_referencia, counter))
         p.start()
         workers.append(p)
     for faixa in ranges:
