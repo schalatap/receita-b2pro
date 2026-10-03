@@ -93,9 +93,7 @@ WITH pagina AS MATERIALIZED (
         emp.razao_social, emp.natureza_juridica, emp.porte, emp.capital_social
     FROM estabelecimentos e
     JOIN empresas emp ON e.cnpj_basico = emp.cnpj_basico
-    WHERE (e.situacao_cadastral IN ('02', '03', '04')
-       OR (e.situacao_cadastral = '08'
-           AND e.data_situacao_cadastral >= CURRENT_DATE - INTERVAL '2 years'))
+    WHERE enrich.no_universo_da_busca(e.situacao_cadastral, e.data_situacao_cadastral, %(referencia)s)
       AND e.cnpj_basico >= %(inicio)s AND e.cnpj_basico < %(teto)s
       AND (e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv) > (%(last_basico)s, %(last_ordem)s, %(last_dv)s)
     ORDER BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv
@@ -288,12 +286,12 @@ def transform(row, socios, index_name, pgfn_referencia):
     }
 
 
-def produce_range(conn, range_start, range_end, out_queue, tempos):
+def produce_range(conn, range_start, range_end, universo_referencia, out_queue, tempos):
     """Busca uma faixa em batches no PG (empresas + sócios) e enfileira cada batch."""
     last_basico, last_ordem, last_dv = '', '', ''
     while True:
         params = {
-            'inicio': range_start, 'teto': range_end,
+            'referencia': universo_referencia, 'inicio': range_start, 'teto': range_end,
             'last_basico': last_basico, 'last_ordem': last_ordem, 'last_dv': last_dv,
             'limite': BATCH_SIZE,
         }
@@ -327,7 +325,7 @@ def produce_range(conn, range_start, range_end, out_queue, tempos):
         last_dv = last_row.cnpj[12:14]
 
 
-def batch_producer(conn, faixas, out_queue, tempos):
+def batch_producer(conn, faixas, universo_referencia, out_queue, tempos):
     """Thread produtora: consome faixas da fila comum até a sentinela e enfileira os batches.
 
     Todo acesso psycopg2 acontece aqui — a conexão nunca cruza threads.
@@ -335,7 +333,7 @@ def batch_producer(conn, faixas, out_queue, tempos):
     """
     try:
         for range_start, range_end in iter(faixas.get, None):
-            produce_range(conn, range_start, range_end, out_queue, tempos)
+            produce_range(conn, range_start, range_end, universo_referencia, out_queue, tempos)
             tempos['faixas'] += 1
         out_queue.put(None)
     except Exception as exc:
@@ -366,7 +364,7 @@ def generate_docs(batch_queue, index_name, pgfn_referencia, counter, tempos):
             counter.value += len(rows)
 
 
-def worker_process(worker_id, faixas, index_name, pgfn_referencia, counter):
+def worker_process(worker_id, faixas, index_name, pgfn_referencia, universo_referencia, counter):
     """Worker: indexa faixas da fila comum até esvaziá-la. Sai com código 1 se perder docs."""
 
     conn = psycopg2.connect(DATABASE_URL)
@@ -385,7 +383,7 @@ def worker_process(worker_id, faixas, index_name, pgfn_referencia, counter):
     batch_queue = queue.Queue(maxsize=PREFETCH_BATCHES)
     producer = Thread(
         target=batch_producer,
-        args=(conn, faixas, batch_queue, tempos),
+        args=(conn, faixas, universo_referencia, batch_queue, tempos),
         daemon=True,
     )
     producer.start()
@@ -422,7 +420,18 @@ def worker_process(worker_id, faixas, index_name, pgfn_referencia, counter):
         sys.exit(1)
 
 
-def compute_ranges(num_ranges):
+def referencia_do_universo(conn):
+    """Mês do lote da Receita carregado: a referência do universo da busca (enrich.no_universo_da_busca,
+    em cnpj-demo/scripts/enrich/gap_ddl.sql), a mesma do índice de contatos compartilhados."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT enrich.referencia_do_universo()")
+        referencia = cur.fetchone()[0]
+    if referencia is None:
+        raise RuntimeError("processed_files sem lote da Receita: ingestão não concluída?")
+    return referencia
+
+
+def compute_ranges(num_ranges, universo_referencia):
     """Divide o keyspace em faixas de tamanho igual pelos percentis reais do banco."""
     conn = psycopg2.connect(DATABASE_URL)
     with conn.cursor() as cur:
@@ -431,10 +440,8 @@ def compute_ranges(num_ranges):
         cur.execute(f"""
             SELECT percentile_disc(ARRAY[{percentiles}]) WITHIN GROUP (ORDER BY cnpj_basico)
             FROM estabelecimentos
-            WHERE (situacao_cadastral IN ('02', '03', '04')
-               OR (situacao_cadastral = '08'
-                   AND data_situacao_cadastral >= CURRENT_DATE - INTERVAL '2 years'))
-        """)
+            WHERE enrich.no_universo_da_busca(situacao_cadastral, data_situacao_cadastral, %(referencia)s)
+        """, {'referencia': universo_referencia})
         boundaries = cur.fetchone()[0]  # lista de cnpj_basico nos percentis
     conn.close()
 
@@ -644,7 +651,9 @@ def main():
     # 1. Preparar tabelas de enriquecimento
     prep_conn = psycopg2.connect(DATABASE_URL)
     pgfn_referencia = prepare_enrich_tables(prep_conn)
+    universo_referencia = referencia_do_universo(prep_conn)
     prep_conn.close()
+    logger.info(f"Universo do lote {universo_referencia:%Y-%m} (baixadas a partir de dois anos antes)")
 
     # 2. VACUUM ANALYZE para estatísticas atualizadas
     vacuum_analyze(DATABASE_URL)
@@ -654,10 +663,8 @@ def main():
     with count_conn.cursor() as cur:
         cur.execute("""
             SELECT COUNT(*) FROM estabelecimentos e
-            WHERE (e.situacao_cadastral IN ('02', '03', '04')
-               OR (e.situacao_cadastral = '08'
-                   AND e.data_situacao_cadastral >= CURRENT_DATE - INTERVAL '2 years'))
-        """)
+            WHERE enrich.no_universo_da_busca(e.situacao_cadastral, e.data_situacao_cadastral, %(referencia)s)
+        """, {'referencia': universo_referencia})
         total = cur.fetchone()[0]
     count_conn.close()
     logger.info(f"Total a indexar: {total:,} estabelecimentos")
@@ -669,7 +676,7 @@ def main():
     logger.info(f"Índice temporário: {new_index}")
 
     # 5. Dividir o keyspace em faixas pequenas numa fila comum e spawnar os workers
-    ranges = compute_ranges(NUM_FAIXAS)
+    ranges = compute_ranges(NUM_FAIXAS, universo_referencia)
     faixas = SimpleQueue()
     counter = Value('i', 0)
     start = datetime.now()
@@ -678,7 +685,7 @@ def main():
     # e, sem consumidores, bloquearia o pai com muitas faixas (reproduzido com 2.048).
     workers = []
     for i in range(NUM_WORKERS):
-        p = Process(target=worker_process, args=(i, faixas, new_index, pgfn_referencia, counter))
+        p = Process(target=worker_process, args=(i, faixas, new_index, pgfn_referencia, universo_referencia, counter))
         p.start()
         workers.append(p)
     for faixa in ranges:
