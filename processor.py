@@ -366,6 +366,10 @@ _DATE_COLS: dict[str, list[str]] = {
     "SOCIOCSV": ["data_entrada_sociedade"],
 }
 
+# Exclusions are scheduled ahead (Receita sets year-end dates), so a future
+# value is real data, not an error.
+_FUTURE_DATE_COLS = {"data_exclusao_do_simples", "data_exclusao_do_mei"}
+
 # Valid Brazilian UF codes
 _VALID_UFS = {
     "AC",
@@ -461,7 +465,8 @@ def _validate(df: pl.DataFrame, file_type: str) -> pl.DataFrame:
                 df = df.with_columns(pl.when(unparseable).then(None).otherwise(pl.col(col)).alias(col))
 
             # Range check: future or before 1900
-            out_of_range = pl.col(col).is_not_null() & ((pl.col(col) > today) | (pl.col(col) < "19000101"))
+            too_late = pl.lit(False) if col in _FUTURE_DATE_COLS else pl.col(col) > today
+            out_of_range = pl.col(col).is_not_null() & (too_late | (pl.col(col) < "19000101"))
             count = df.filter(out_of_range).height
             if count > 0:
                 logger.warning(f"{col}: {count} dates out of range → null (future or before 1900)")
