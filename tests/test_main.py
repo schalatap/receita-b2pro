@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import polars as pl
 import pytest
 
-from main import _parquet_worker, _pg_worker, get_file_priority, group_files_by_dependency, main
+from main import _parquet_worker, _pg_worker, get_file_priority, group_files_by_dependency, main, travar_execucao
 
 
 class TestGetFilePriority:
@@ -809,3 +809,18 @@ class TestParquetResume:
 
         with pytest.raises(SystemExit):
             main()
+
+
+class TestTravarExecucao:
+    def test_segunda_carga_com_o_mesmo_temp_dir_aborta(self, tmp_path):
+        primeira = travar_execucao(tmp_path)
+        try:
+            with pytest.raises(SystemExit) as saida:
+                travar_execucao(tmp_path)
+            assert saida.value.code == 1
+        finally:
+            primeira.close()
+
+    def test_trava_e_liberada_quando_a_carga_termina(self, tmp_path):
+        travar_execucao(tmp_path).close()
+        travar_execucao(tmp_path).close()

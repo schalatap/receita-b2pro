@@ -11,12 +11,14 @@ Usage:
 """
 
 import argparse
+import fcntl
 import logging
 import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import TextIO
 
 from tqdm import tqdm
 
@@ -147,6 +149,22 @@ def _parquet_worker(zip_filename, directory, downloader, parquet, cfg):
             raise
 
 
+def travar_execucao(temp_dir: Path) -> TextIO:
+    """Trava exclusiva em TEMP_DIR durante toda a carga (o sistema solta se o processo morrer).
+
+    Uma segunda carga simultânea recriaria os índices que a primeira derrubou, truncaria tabelas
+    já carregadas e disputaria os ZIPs de temp/. Adaptado do upstream 6b1ceae, só Linux.
+    """
+    trava = open(temp_dir / ".pipeline.lock", "w")
+    try:
+        fcntl.flock(trava, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        trava.close()
+        logger.error(f"Outra carga está rodando com {temp_dir}; abortando sem alterar nada.")
+        sys.exit(1)
+    return trava
+
+
 def main():
     """Main pipeline entry point."""
     args = parse_args()
@@ -168,6 +186,7 @@ def main():
             print(f"  {month}")
         return
 
+    trava = travar_execucao(temp_abs)
     is_parquet = config.output_format == "parquet"
 
     if not is_parquet and not config.database_url:
@@ -432,6 +451,7 @@ def main():
                 pass
             db.disconnect()
         downloader.cleanup()
+        trava.close()
 
 
 if __name__ == "__main__":
