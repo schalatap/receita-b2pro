@@ -369,7 +369,13 @@ def worker_process(worker_id, faixas, index_name, pgfn_referencia, universo_refe
 
     conn = psycopg2.connect(DATABASE_URL)
     conn.set_session(readonly=True)
-    es = Elasticsearch(ES_HOST, basic_auth=(ES_USER, ES_PASS), verify_certs=False)
+    # O max_retries do streaming_bulk só cobre 429; timeout de transporte derrubava o worker
+    # (25/11: um bulk passou de 10 s com o ES saturado e steal alto). Reenviar é idempotente
+    # porque o _id é o CNPJ.
+    es = Elasticsearch(
+        ES_HOST, basic_auth=(ES_USER, ES_PASS), verify_certs=False,
+        request_timeout=120, retry_on_timeout=True,
+    )
 
     # Produtora (PG) e consumidora (transformação + envio ao ES) rodam sobrepostas:
     # - pg_empresas/pg_socios: tempo da produtora no PG; fila_cheia: produtora parada porque a
